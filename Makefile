@@ -8,7 +8,7 @@
 	fips-scan fips-scanner fips-smoke \
 	dev-env dev-push dev-integration \
 	manifests-demo manifests-odh manifests-openshift \
-	e2e-setup e2e-teardown e2e-test \
+	e2e-setup e2e-teardown e2e-test e2e-setup-extended test-e2e-extended \
 	setup-hooks \
 	help
 
@@ -334,6 +334,18 @@ e2e-teardown:
 e2e-test:
 	bash hack/scripts/e2e-test.sh $(if $(V),-- --nocapture,)
 
+# Extended qualification tier (proposal #27 How?). Builds the image with
+# k8s-e2e so e2e_body_oracle is registered, applies e2e-extended overlay on
+# top of the baseline Forge e2e stack, then runs ignored extended tests.
+E2E_EXTENDED_FEATURES ?= responses,k8s-e2e
+
+e2e-setup-extended:
+	$(MAKE) e2e-setup FIPS_FEATURES="$(E2E_EXTENDED_FEATURES)"
+	kubectl --context kind-praxis-e2e apply -k deploy/overlays/e2e-extended/
+
+test-e2e-extended:
+	bash hack/scripts/e2e-test-extended.sh $(if $(V),-- --nocapture,)
+
 # ---------------------------------------------------------------------------
 # Iterative Development
 # ---------------------------------------------------------------------------
@@ -435,6 +447,8 @@ help:
 	@echo "  e2e-setup        create Kind cluster + install all stacks"
 	@echo "  e2e-teardown     delete Kind e2e cluster"
 	@echo "  e2e-test         run k8s e2e tests against cluster"
+	@echo "  e2e-setup-extended  baseline e2e-setup + e2e-extended overlay (k8s-e2e image)"
+	@echo "  test-e2e-extended   run ignored qualification tier (k8s_e2e::extended)"
 	@echo ""
 	@echo "Dev Setup:"
 	@echo "  setup-hooks      install git pre-commit hook"
