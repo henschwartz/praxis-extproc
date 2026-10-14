@@ -68,24 +68,6 @@ async fn main() {
 // Startup
 // -----------------------------------------------------------------------------
 
-/// Build the AI filter registry (and e2e helpers when `k8s-e2e` is enabled).
-#[cfg(feature = "k8s-e2e")]
-fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
-    let mut registry = praxis_ai_filters::build_ai_registry();
-    praxis_extproc::e2e::register_e2e_filters(&mut registry)?;
-    Ok(registry)
-}
-
-/// Build the AI filter registry (default features — no e2e helpers).
-#[cfg(not(feature = "k8s-e2e"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "same Result signature as the k8s-e2e registry builder"
-)]
-fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(praxis_ai_filters::build_ai_registry())
-}
-
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before anything that builds a filter registry, a subrequest client or a
@@ -97,7 +79,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
-        fips.require()?;
+        if let Some(reason) = fips_refusal(&fips, &registry) {
+            return Err(reason.into());
+        }
         pipeline?;
         info!("configuration is valid");
         return Ok(());
@@ -108,9 +92,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // PRAXIS_REQUIRE_FIPS makes FIPS mode a hard requirement. The host decides
     // whether it is in effect; when it is not, the process stays up and
     // inspectable (health NotServing) but serves no traffic.
-    if let Err(e) = fips.require() {
-        error!(error = %e, "refusing to serve");
-        return Box::pin(serve_unready(addrs, fips.active())).await;
+    if let Some(reason) = fips_refusal(&fips, &registry) {
+        error!(error = %reason, "refusing to serve");
+        return Box::pin(serve_unready(addrs, praxis_extproc::fips::active(&fips))).await;
     }
 
     Box::pin(serve_pipeline(
@@ -118,9 +102,44 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pipeline,
         &cfg.server,
         cfg.max_body_accumulation(),
-        fips.active(),
+        praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+
+/// Build the AI filter registry, plus the k8s e2e body-oracle when
+/// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
+/// never enables that feature).
+#[cfg(feature = "k8s-e2e")]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    praxis_extproc::e2e::register_e2e_filters(&mut registry)?;
+    Ok(registry)
+}
+
+/// Build the AI filter registry (no e2e-only filters).
+#[cfg(not(feature = "k8s-e2e"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same Result signature as the k8s-e2e registry builder"
+)]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(praxis_ai_filters::build_ai_registry())
+}
+
+/// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
+/// not: FIPS mode is not in effect on the host, or the binary registers
+/// filters whose dependencies do their own cryptography (the same refusal,
+/// by contents rather than by host).
+fn fips_refusal(fips: &praxis_extproc::fips::Status, registry: &praxis_filter::FilterRegistry) -> Option<String> {
+    if let Err(e) = praxis_extproc::fips::require(fips) {
+        return Some(e.to_string());
+    }
+    if praxis_extproc::fips::required() {
+        return praxis_extproc::fips::blocker(registry);
+    }
+    None
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
@@ -282,6 +301,7 @@ async fn serve_grpc(
     let svc = ExternalProcessorServer::new(
         PraxisExtProc::new(pipeline)
             .with_max_body_accumulation(max_body)
+            .with_trust_forwarded_for(server_cfg.trust_forwarded_for)
             .with_force_shutdown(force_rx.clone()),
     );
     let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs.get());

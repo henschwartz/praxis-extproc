@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Red Hat, Inc.
 
-//! Request-body SHA-256 oracle for extended k8s e2e qualification.
+
+//! Request-body SHA-256 oracle filter for k8s e2e qualification.
+//!
+//! Non-production: compiled only with `--features k8s-e2e` and registered on
+//! the AI filter registry from [`super::register_e2e_filters`].
 //!
 //! After request-body EOS, hashes the accumulated body and sets a response
 //! header. Hop index comes from `BODY_ORACLE_HOP_INDEX` (not response-header
@@ -187,7 +191,7 @@ fn publish_digest_header(
         response.headers.insert(header_name, header_value);
     }
     debug!(
-        target: "praxis_extproc::e2e_body_oracle",
+        target: "e2e_body_oracle",
         qualification_body_digest = %digest,
         hop_index = ?filter.hop_index,
         "qualification body digest"
@@ -238,6 +242,7 @@ impl HttpFilter for BodyOracleFilter {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 
@@ -276,6 +281,18 @@ mod tests {
             filter.header_name(),
             "x-qualification-request-sha256",
             "single-hop name"
+        );
+    }
+
+    #[test]
+    fn register_adds_filter_to_registry() {
+        use praxis_filter::FilterRegistry;
+
+        let mut registry = FilterRegistry::with_builtins();
+        crate::e2e::register_e2e_filters(&mut registry).expect("register e2e_body_oracle");
+        assert!(
+            registry.available_filters().contains(&"e2e_body_oracle"),
+            "registry should carry e2e_body_oracle after register()"
         );
     }
 }

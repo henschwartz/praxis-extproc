@@ -96,9 +96,14 @@ filter_chains:
           - X-MaaS-Internal   # strip inbound MaaS-owned headers
 
       # 2. body-field-to-header (model-extractor)
-      #    ->  model_to_header  (full parity)
-      - filter: model_to_header
-        header: X-Gateway-Model-Name
+      #    ->  json_body request_extract (full parity;
+      #    see the promotion-header note below)
+      - filter: json_body
+        request_extract:
+          - pointer: /model                 # IPP fieldName: model
+            header: X-Gateway-Model-Name    # IPP headerName
+        on_invalid: continue                # absent/invalid body -> pass through
+        max_body_bytes: 1048576             # core default is 10 MiB; size per workload
 
       # 3. model-provider-resolver  ->  intelligent_route
       #    K8s routing gap tracked in #5, #7. Candidates
@@ -142,25 +147,47 @@ filter_chains:
 
 ### Plugin mapping
 
-| Go IPP plugin | Praxis filter | Parity | Gap tracked by |
-|---|---|---|---|
-| `body-field-to-header` | `model_to_header` | Full | — |
-| `maas-headers-guard` | `headers` + `when`/`unless` | Partial | [#5] |
-| `model-provider-resolver` | `intelligent_route` | Partial (K8s) | [#5], [#7] |
-| `stream-usage-enforcer` | *(none yet)* | **None** | [#44] |
-| `api-translation` | provider-native chain | Partial (reverse) | [#6] |
-| `apikey-injection` | `credential_inject` | Partial (SigV4/OAuth2) | [#6] |
+| Go IPP plugin                                | Praxis filter                         | Parity                 | Gap tracked by |
+|----------------------------------------------|---------------------------------------|------------------------|----------------|
+| `body-field-to-header`                       | `json_body` (`request_extract`)       | Full*                  | —              |
+| `maas-headers-guard`                         | `headers` + `when`/`unless`           | Partial                | [#5]           |
+| `model-provider-resolver`                    | `intelligent_route`                   | Partial (K8s)          | [#5], [#7]     |
+| `stream-usage-enforcer`                      | *(none yet)*                          | **None**               | [#44]          |
+| `api-translation`                            | provider-native chain                 | Partial (reverse)      | [#6]           |
+| `apikey-injection`                           | `credential_inject`                   | Partial (SigV4/OAuth2) | [#6]           |
+| `nemo-request-guard` / `nemo-response-guard` | `ai_guardrails`                       | Partial (timeout unit) | [#111]         |
 
 [#5]: https://github.com/opendatahub-io/praxis-extproc/issues/5
 [#6]: https://github.com/opendatahub-io/praxis-extproc/issues/6
 [#7]: https://github.com/opendatahub-io/praxis-extproc/issues/7
+[#111]: https://github.com/opendatahub-io/praxis-extproc/issues/111
+[crd-weight]: https://github.com/opendatahub-io/ai-gateway-payload-processing/blob/02b214fc48e14ed12981d5e0c8bee76492e3800a/api/inference/v1alpha1/externalmodel_types.go#L101-L109
 
 ### Per-plugin notes
 
-- **`body-field-to-header` → `model_to_header`.**
-  Full parity. IPP's `fieldName: model` is fixed in
-  the Praxis filter (it always promotes the `model`
-  field); `headerName` maps to the `header` option.
+- **`body-field-to-header` → `json_body`.** The core
+  `json_body` filter promotes any body field with a
+  `request_extract` entry: `pointer` (→ `fieldName`,
+  as an RFC 6901 JSON Pointer such as `/model`) and
+  `header` (→ `headerName`). Set `on_invalid: continue`
+  to match IPP's pass-through on an absent or invalid
+  body. A single `json_body` filter can list multiple
+  `request_extract` entries and rewrite the body in
+  the same pass, so it supersedes the older
+  `model_to_header` and `json_body_field` filters.
+
+  **\*Promotion-header safety differs.** `model_to_header`
+  rejected unsafe target headers at config time —
+  transport (`host`, `content-length`), credential
+  (`authorization`, `x-api-key`, `cookie`), and
+  internal `x-praxis-*` names. `json_body` validates
+  only that the `header` name is syntactically valid;
+  it does **not** reject sensitive targets (that
+  guardrail lives in the `praxis-ai` promotion layer,
+  which core `json_body` cannot depend on). Because the
+  controller renders these configs, it must not emit a
+  `header` that targets a transport, credential, or
+  `x-praxis-*` name.
 - **`maas-headers-guard` → `headers`.** IPP captures
   inbound `x-maas-*` headers into request state for
   downstream plugins and guards them from
@@ -175,6 +202,29 @@ filter_chains:
   overlay (`routing-overlay.json`) with hot reload.
   The K8s-native routing behavior is tracked in [#5]
   and [#7].
+
+  **Weight scale and disable semantics differ — the
+  controller must translate.** The `ExternalModel`
+  CRD's `externalProviderRefs[].weight` is an integer
+  in `0–100`, defaulting to `1`, where `0` means
+  *disabled* — folding magnitude and enablement into
+  one field ([`externalmodel_types.go`][crd-weight]).
+  The overlay splits these into two orthogonal fields
+  per candidate:
+  - `traffic_weight` — an integer in `1–1000`
+    (only consulted when the selection group's picker
+    mode is `weighted_random`). `0` is **rejected**,
+    so a disabled provider must not be emitted as
+    `traffic_weight: 0`.
+  - `admission_state` — enablement, independent of
+    weight. Use `none` to exclude a candidate.
+
+  So when rendering the overlay, map a Go weight `w`:
+  - `w == 0` → **omit the provider from the
+    candidates list** (disabled).
+  - `w in 1–100` → rescale into `1–1000` (for example
+    `traffic_weight = w * 10`) and leave
+    `admission_state` at its enabled value.
 - **`stream-usage-enforcer` → none.** No Praxis
   filter injects `stream_options: {include_usage:
   true}` today. This is the only capability with no
@@ -237,6 +287,32 @@ targeting Praxis ExtProc instead of Go IPP:
   Do not render this filter yet; it does not exist in
   the registry and pipeline construction fails on
   unknown filter names. Track via [#44].
+- **Convert the NeMo guardrail timeout to
+  milliseconds.** The IPP plugin's `timeoutSeconds` is
+  in seconds and defaults to `360`
+  ([`nemo_guard_base.go:43`][ipp-nemo]); the Praxis
+  `ai_guardrails` filter takes `timeout_ms` in
+  milliseconds and defaults to `10000` (10 s). Render
+  `timeout_ms` as the IPP `timeoutSeconds` value ×
+  1000 (for example, 360 s -> `timeout_ms: 360000`),
+  first resolving a zero or negative `timeoutSeconds`
+  to `360` — IPP treats nonpositive values as its
+  360 s default ([`nemo_guard_base.go`][ipp-nemo]), and
+  multiplying them directly yields `timeout_ms: 0`
+  (which Praxis rejects) or a negative value (which
+  does not deserialize as its unsigned timeout). Do
+  not copy the seconds value verbatim — `timeout_ms:
+  360` is 360 ms and will fail most rail checks. `ai_guardrails` has no `failure_mode` of its
+  own, and a timeout is handled differently per phase:
+  a request-phase failure propagates to the enclosing
+  Envoy HTTP `ext_proc` filter, where
+  `failure_mode_allow` decides fail-open vs
+  fail-closed; a response-phase failure replaces the
+  response body with a `guardrail_error` payload
+  (headers are already sent, so it cannot reject).
+  Tracked in [#111].
+
+[ipp-nemo]: https://github.com/opendatahub-io/ai-gateway-payload-processing/blob/7b58c88cb1187d08e43d5ec82e62130a667df1db/pkg/plugins/nemo/nemo_guard_base.go#L43
 
 [#4]: https://github.com/opendatahub-io/praxis-extproc/issues/4
 [#16]: https://github.com/opendatahub-io/praxis-extproc/issues/16

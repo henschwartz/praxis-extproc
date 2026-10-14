@@ -15,14 +15,14 @@ use praxis_proto::envoy::service::{
     ext_proc::v3::{ProcessingResponse, processing_request},
 };
 use tonic::Status;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     adapter, metrics,
     pipeline::{
-        MutationDelivery, RequestPhase, ResponsePhase, passthrough_chunk, process_streamed_body_chunk,
-        run_request_header_filters_early, run_request_pipeline, run_response_header_filters_early,
-        run_response_pipeline,
+        MutationDelivery, RequestPhase, ResponsePhase, direction_label, flush_streamed_body_filters, passthrough_chunk,
+        process_streamed_body_chunk, run_request_header_filters_early, run_request_pipeline,
+        run_response_header_filters_early, run_response_pipeline,
     },
     protocol::{PhaseState, ProtocolPhase, duplicate_after_eos, request_type_label},
     response::{self, BodyMode},
@@ -147,6 +147,10 @@ fn handle_body_redelivery(
 /// For `FDS` passthrough, runs header filters early, defers mutations to first chunk.
 ///
 /// [`Request`]: praxis_filter::Request
+#[expect(
+    clippy::large_stack_frames,
+    reason = "StreamState carries HttpFilterContext fields grown in praxis 0.7.3"
+)]
 pub(crate) async fn handle_request_headers(
     pipeline: &FilterPipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
@@ -231,8 +235,11 @@ async fn accumulate_request_body(
 
 /// Handle response headers: run response filters and respond with mutations.
 ///
-/// For `BUFFERED`, runs filters early and defers mutations to body phase
-/// (Envoy honours `CommonResponse.header_mutation` on body responses).
+/// For `BUFFERED` with body filters, returns no mutations now and runs the full
+/// pipeline at body EOS (Envoy honours `CommonResponse.header_mutation` on the
+/// body response).
+/// For `BUFFERED` without body filters, runs filters early and defers mutations
+/// to the body response.
 /// For `NONE`, runs filters early and sends mutations immediately because no
 /// response body message is delivered.
 /// For `STREAMED`, runs filters early and sends mutations immediately
@@ -273,6 +280,7 @@ pub(crate) async fn handle_response_headers(
             run_response_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
+        _ if pipeline.body_capabilities().needs_response_body => Ok(vec![response::response_headers(None)]),
         _ => run_response_header_filters_early(pipeline, state, MutationDelivery::DeferWithResponse).await,
     }
 }
@@ -319,6 +327,101 @@ async fn accumulate_response_body(
     }
 
     run_response_pipeline(ResponsePhase::Body, pipeline, state).await
+}
+
+// -----------------------------------------------------------------------------
+// Trailers
+// -----------------------------------------------------------------------------
+
+/// Handle trailers for one direction: release any held-back body work, then
+/// acknowledge with a `TrailersResponse`.
+pub(crate) async fn handle_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let mut responses = finalize_body_on_trailers(pipeline, state, is_request).await?;
+    // Envoy ignores everything after an immediate response, so skip the ack then.
+    if !responses.last().is_some_and(response::is_immediate) {
+        responses.push(if is_request {
+            response::request_trailers()
+        } else {
+            response::response_trailers()
+        });
+    }
+    Ok(responses)
+}
+
+/// Complete a body phase that trailers, not `end_of_stream`, close.
+///
+/// Envoy signals the end of a body carrying trailers with the trailers message
+/// itself. Work held back for end-of-stream — the accumulated `BUFFERED` body or
+/// a `STREAMED` filter's end-of-stream call — must run now or the stream stalls.
+async fn finalize_body_on_trailers(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    if !state.body_open(is_request) {
+        return Ok(Vec::new());
+    }
+
+    let (phase, mode, needs_body) = trailing_body_phase(pipeline, state, is_request);
+    state.eos_tracker.mark_complete(phase);
+
+    match mode {
+        BodyMode::Streamed if needs_body => flush_streamed_body_filters(pipeline, state, is_request).await,
+        // A BUFFERED body that never arrived (empty) still needs its pipeline run,
+        // but there is no body message to carry header/body mutations; only an
+        // immediate (rejection) applies.
+        BodyMode::Buffered => {
+            let responses = if is_request {
+                run_request_pipeline(RequestPhase::Body, pipeline, state).await?
+            } else {
+                run_response_pipeline(ResponsePhase::Body, pipeline, state).await?
+            };
+            Ok(rejection_only(responses, is_request))
+        },
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Resolve the body phase, configured body mode, and body need for one direction.
+fn trailing_body_phase(
+    pipeline: &FilterPipeline,
+    state: &StreamState,
+    is_request: bool,
+) -> (ProtocolPhase, BodyMode, bool) {
+    let caps = pipeline.body_capabilities();
+    if is_request {
+        (
+            ProtocolPhase::RequestBody,
+            state.protocol_config.request_body_mode,
+            caps.needs_request_body,
+        )
+    } else {
+        (
+            ProtocolPhase::ResponseBody,
+            state.protocol_config.response_body_mode,
+            caps.needs_response_body,
+        )
+    }
+}
+
+/// Keep only an `ImmediateResponse` from a pipeline run that had no body message
+/// to answer.
+///
+/// A BUFFERED body that turns out to be empty never produces a body message, so
+/// header and body mutations have nothing to ride on; a rejection still applies.
+fn rejection_only(responses: Vec<ProcessingResponse>, is_request: bool) -> Vec<ProcessingResponse> {
+    let immediate: Vec<ProcessingResponse> = responses.into_iter().filter(response::is_immediate).collect();
+    if immediate.is_empty() {
+        warn!(
+            direction = direction_label(is_request),
+            "trailers closed an empty BUFFERED body; pipeline header mutations have no message to apply to and are dropped"
+        );
+    }
+    immediate
 }
 
 // -----------------------------------------------------------------------------
@@ -475,6 +578,127 @@ mod tests {
         ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
             Ok(Box::new(Self))
         }
+    }
+
+    /// Response filter that upgrades the response body mode dynamically in
+    /// `on_response` (as `ai_guardrails` does) and only mutates the body in
+    /// `on_response_body` when it observes that upgrade. If the two hooks run on
+    /// different contexts, the upgrade is lost and the mutation never fires.
+    struct ResponseBodyBufferProbe;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ResponseBodyBufferProbe {
+        fn name(&self) -> &'static str {
+            "response_body_buffer_probe"
+        }
+
+        async fn on_request(&self, _: &mut HttpFilterContext<'_>) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            ctx.set_response_body_mode(praxis_filter::BodyMode::StreamBuffer { max_bytes: Some(1024) });
+            Ok(FilterAction::Continue)
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn on_response_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<bytes::Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if end_of_stream && matches!(ctx.response_body_mode, praxis_filter::BodyMode::StreamBuffer { .. }) {
+                *body = Some(bytes::Bytes::from_static(b"REPLACED"));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+
+    impl ResponseBodyBufferProbe {
+        /// Registry factory for the buffered response-body regression test.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Regression: under BUFFERED, a response filter that sets its body mode in
+    /// `on_response` must still have `on_response_body` observe it. The response
+    /// pipeline must therefore defer to body EOS (like the request side) rather than
+    /// run `on_response` early on a throwaway header-time context.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "regression test exercises the full buffered response handoff"
+    )]
+    #[tokio::test]
+    async fn buffered_response_body_filter_runs_at_body_eos_with_dynamic_mode() {
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: response_body_buffer_probe\n",
+        )
+        .unwrap();
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "response_body_buffer_probe",
+                praxis_filter::http_builtin(ResponseBodyBufferProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+
+        let mut state = StreamState::new();
+        state.protocol_config.response_body_mode = BodyMode::Buffered;
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Response headers (not EOS): the pipeline must be deferred, not run early.
+        handle_response_headers(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpHeaders::default(),
+            &mut state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !state.header_state.response_filters_executed,
+            "a body-dependent buffered response pipeline must defer to body EOS, not run filters at header time"
+        );
+
+        // Buffered body (EOS): on_response upgrades the mode and on_response_body,
+        // sharing the same context, replaces the body.
+        let body_responses = handle_response_body(
+            &pipeline,
+            praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+                body: b"original-upstream-body".to_vec(),
+                end_of_stream: true,
+            },
+            &mut state,
+        )
+        .await
+        .unwrap();
+
+        let replaced = body_responses.iter().any(|r| {
+            matches!(
+                r.response.as_ref(),
+                Some(praxis_proto::envoy::service::ext_proc::v3::processing_response::Response::ResponseBody(b))
+                    if b.response.as_ref().and_then(|c| c.body_mutation.as_ref()).is_some_and(|m| matches!(
+                        &m.mutation,
+                        Some(praxis_proto::envoy::service::ext_proc::v3::body_mutation::Mutation::Body(bytes))
+                            if bytes.as_slice() == b"REPLACED"
+                    ))
+            )
+        });
+        assert!(
+            replaced,
+            "buffered response body filter must apply its mutation; the StreamBuffer upgrade was dropped: {body_responses:?}"
+        );
     }
 
     #[expect(

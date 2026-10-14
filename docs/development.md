@@ -48,7 +48,8 @@ cargo test -- test_name
 src/
   lib.rs               # Crate root, module declarations
   bin/
-    praxis_extproc.rs  # Binary entry point, CLI, startup
+    praxis_extproc.rs  # Product binary (registers e2e_body_oracle with k8s-e2e)
+  e2e/                 # Non-production: body oracle (compiled with --features k8s-e2e)
   adapter.rs           # ExtProc ↔ Praxis type translation
   config.rs            # YAML config loading, pipeline build
   error.rs             # Error types (thiserror)
@@ -65,6 +66,7 @@ tests/
   grpc_server.rs       # In-process gRPC server tests
   services.rs          # Health and metrics service tests
   integration.rs       # Kubernetes integration tests
+  k8s_e2e/             # Black-box e2e tests (feature k8s-e2e), incl. body-oracle
 examples/
   praxis-extproc.yaml  # Example ExtProc configuration
   envoy.yaml           # Example Envoy configuration
@@ -207,8 +209,11 @@ Cargo is invoked with `--ignore-rust-version` because
 Red Hat's toolset trails the declared rust-version.
 Builds for the host architecture. The runtime image
 runs as UID 1001 (OpenShift-friendly numeric non-root
-user). Konflux (`.tekton/`) builds the same file with
+user). ODH Konflux (`.tekton/`) builds `Containerfile` with
 its defaults, which are the FIPS feature set.
+`Dockerfile.konflux` matches that builder and runtime for
+downstream Konflux; keep it in sync when you change the
+product image recipe (see [FIPS](fips.md#midstream-vs-downstream-container-files)).
 
 ## CI
 
@@ -230,30 +235,18 @@ warnings fatal.
 
 
 
-## Extended e2e qualification tier
+## K8s e2e body-oracle qualification
 
-Long-running scenarios from
+The two-hop request-body SHA-256 oracle from
 [proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
-(`ai`/`opendatahub-io` issue
-[#27](https://github.com/opendatahub-io/praxis-extproc/issues/27)).
-These stay out of default PR CI.
-
-```console
-make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay (image with k8s-e2e)
-make test-e2e-extended    # cargo test --features k8s-e2e -- … extended --ignored
-```
-
-Environment knobs:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `QUALIFICATION_IDLE_SECS` | `300` | Default idle wait when a matrix cell omits `idle_secs` |
-| `E2E_EXTENDED_PROFILE` | `maas_two_hop_fd_streamed` | Topology inventory selection |
-| `GATEWAY_URL` | (auto) | Same as baseline k8s-e2e |
-
-Artifacts land under `target/e2e-extended/report.json`. Release runs use
-`workflow_dispatch` on `.github/workflows/ci-k8s-e2e.yaml` with
-`run_extended=true` (job timeout 120 minutes).
+(issue [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27))
+lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
+`praxis-extproc` image with `--features k8s-e2e` (same product binary; the
+non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
+registered only under that feature), and `make e2e-test` exercises it through
+`tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
+TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
+in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 
 ## FIPS Tooling
 
@@ -305,12 +298,19 @@ build, and `fips-report` runs the report against
 2. **Binary**: links the system `libcrypto.so.3`
    dynamically, defines no symbol of a bundled crypto
    backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
-   `OPENSSL_`), imports OpenSSL, carries the
-   cargo-auditable manifest (`.dep-v0`, built from
-   cargo's SBOM precursor, listing no denied crate) and
-   the rustc producer string. A binary that is missing,
-   unreadable or not an ELF file is a finding, not a
-   skipped check.
+   `OPENSSL_`), imports its cryptography from the system
+   OpenSSL and imports only reviewed OpenSSL symbols —
+   every `name@OPENSSL_version` symbol it imports is on
+   the reviewed allowlist in
+   `xtask/assets/fips/openssl-nondeprecated-symbols.txt`
+   (every non-deprecated libcrypto/libssl export through
+   OpenSSL 3.5), so an unlisted or deprecated versioned
+   OpenSSL import, or a binary with no GNU symbol-version
+   table, is a finding — carries the cargo-auditable
+   manifest (`.dep-v0`, built from cargo's SBOM
+   precursor, listing no denied crate) and the rustc
+   producer string. A binary that is missing, unreadable
+   or not an ELF file is a finding, not a skipped check.
 3. **Source guards**: the application never enables a
    FIPS provider itself, never uses OpenSSL's legacy
    (non-provider) digest API, never vendors or

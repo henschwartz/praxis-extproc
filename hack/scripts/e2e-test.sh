@@ -39,6 +39,15 @@ else
   reachable "http://127.0.0.1:${PORT}/" || { echo "e2e: port-forward did not become ready" >&2; exit 1; }
   export GATEWAY_URL="http://127.0.0.1:${PORT}"
   echo "e2e: using ${GATEWAY_URL}"
+
+  # A single `kubectl port-forward` tunnel collapses when the default,
+  # fully-parallel test run floods it with concurrent requests (connection
+  # resets, then a dead tunnel). The direct LoadBalancer path above has no such
+  # bottleneck. Serialize here so the tunnel stays healthy; an explicit
+  # `--test-threads` on the CLI still overrides this default.
+  : "${RUST_TEST_THREADS:=1}"
+  export RUST_TEST_THREADS
+  echo "e2e: serializing tests over the port-forward (RUST_TEST_THREADS=${RUST_TEST_THREADS})"
 fi
 
 cargo test --features k8s-e2e --test k8s_e2e "$@"
