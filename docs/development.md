@@ -207,8 +207,11 @@ Cargo is invoked with `--ignore-rust-version` because
 Red Hat's toolset trails the declared rust-version.
 Builds for the host architecture. The runtime image
 runs as UID 1001 (OpenShift-friendly numeric non-root
-user). Konflux (`.tekton/`) builds the same file with
+user). ODH Konflux (`.tekton/`) builds `Containerfile` with
 its defaults, which are the FIPS feature set.
+`Dockerfile.konflux` matches that builder and runtime for
+downstream Konflux; keep it in sync when you change the
+product image recipe (see [FIPS](fips.md#midstream-vs-downstream-container-files)).
 
 ## CI
 
@@ -305,12 +308,19 @@ build, and `fips-report` runs the report against
 2. **Binary**: links the system `libcrypto.so.3`
    dynamically, defines no symbol of a bundled crypto
    backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
-   `OPENSSL_`), imports OpenSSL, carries the
-   cargo-auditable manifest (`.dep-v0`, built from
-   cargo's SBOM precursor, listing no denied crate) and
-   the rustc producer string. A binary that is missing,
-   unreadable or not an ELF file is a finding, not a
-   skipped check.
+   `OPENSSL_`), imports its cryptography from the system
+   OpenSSL and imports only reviewed OpenSSL symbols —
+   every `name@OPENSSL_version` symbol it imports is on
+   the reviewed allowlist in
+   `xtask/assets/fips/openssl-nondeprecated-symbols.txt`
+   (every non-deprecated libcrypto/libssl export through
+   OpenSSL 3.5), so an unlisted or deprecated versioned
+   OpenSSL import, or a binary with no GNU symbol-version
+   table, is a finding — carries the cargo-auditable
+   manifest (`.dep-v0`, built from cargo's SBOM
+   precursor, listing no denied crate) and the rustc
+   producer string. A binary that is missing, unreadable
+   or not an ELF file is a finding, not a skipped check.
 3. **Source guards**: the application never enables a
    FIPS provider itself, never uses OpenSSL's legacy
    (non-provider) digest API, never vendors or

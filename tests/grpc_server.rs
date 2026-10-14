@@ -235,6 +235,126 @@ async fn response_trailers_passthrough() {
 }
 
 #[tokio::test]
+async fn none_body_mode_runs_pipeline_at_headers() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // NONE(0) body mode: headers are the complete message even without EOS, so
+    // the pipeline runs at the header phase and never waits for a body.
+    let mut headers = make_request_headers("POST", "/none", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 0,
+        response_body_mode: 0,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    let mutations = extract_all_set_headers(&responses);
+    assert!(
+        mutations.iter().any(|h| h.key == "x-test" && h.value == "extproc"),
+        "NONE mode should run the header pipeline and emit the x-test mutation without a body message"
+    );
+}
+
+#[tokio::test]
+async fn buffered_request_body_closed_by_trailers_acks() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(GUARDRAILS_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    // BUFFERED request body announced by headers(EOS=false), but no body message
+    // arrives; trailers close the body. The held pipeline work must run and the
+    // trailers must be acknowledged rather than the stream stalling.
+    let mut headers = make_request_headers("POST", "/trailers", false);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 2,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::RequestTrailers(_)))),
+        "trailers closing a BUFFERED body should be acknowledged with a RequestTrailers response"
+    );
+    assert!(
+        !responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ImmediateResponse(_)))),
+        "clean empty body should not be rejected"
+    );
+}
+
+#[tokio::test]
+async fn buffered_response_body_closed_by_trailers_acks() {
+    use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
+
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let response = client.process(stream).await.expect("process call failed");
+    let mut inbound = response.into_inner();
+
+    let mut headers = make_request_headers("GET", "/trailers", true);
+    headers.protocol_config = Some(ProtocolConfiguration {
+        request_body_mode: 2,
+        response_body_mode: 2,
+        send_body_without_waiting_for_header_response: false,
+    });
+    tx.send(headers).await.expect("send headers");
+    drop(inbound.message().await);
+
+    // Response body announced by headers(EOS=false), closed by trailers alone.
+    tx.send(make_response_headers(200, false))
+        .await
+        .expect("send response headers");
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseTrailers(HttpTrailers { trailers: None })),
+        ..Default::default()
+    })
+    .await
+    .expect("send response trailers");
+    drop(tx);
+
+    let responses = collect_responses(&mut inbound).await;
+
+    assert!(
+        responses
+            .iter()
+            .any(|r| matches!(&r.response, Some(RespVariant::ResponseTrailers(_)))),
+        "trailers closing a BUFFERED response body should be acknowledged with a ResponseTrailers response"
+    );
+}
+
+#[tokio::test]
 async fn body_with_headers_deferred_response() {
     let (mut client, _shutdown) = start_server(HEADERS_CONFIG).await;
 
@@ -315,14 +435,14 @@ async fn response_body_with_header_mutations() {
     );
 }
 
-/// Under BUFFERED, the response pipeline runs early at the response-headers
-/// phase, and `run_response_pipeline` skips `execute_response` at body EOS.
+/// Under BUFFERED with a body filter, the response pipeline defers to body EOS
+/// and runs `on_response` and `on_response_body` together on one shared context.
 /// A filter that stashes a decision in `filter_metadata` during `on_response`
 /// and reads it in `on_response_body` (the anthropic messages->chat-completions
-/// transform) only works if that metadata is persisted across the two phases.
-/// Regression test for the fix in `run_response_header_filters_early`: without
-/// it the transform metadata is dropped and the upstream (OpenAI-shaped) body
-/// passes through untransformed.
+/// transform) only works if both hooks see the same context. Regression test for
+/// the body-EOS deferral: if `on_response` ran early on a throwaway header-time
+/// context, the decision would be dropped and the upstream (OpenAI-shaped) body
+/// would pass through untransformed.
 #[tokio::test]
 async fn buffered_response_transform_metadata_survives_body_phase() {
     use praxis_proto::envoy::service::ext_proc::v3::{ProtocolConfiguration, body_mutation};

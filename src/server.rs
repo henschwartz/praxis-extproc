@@ -29,12 +29,13 @@ use tracing::{debug, error, warn};
 
 use crate::{
     handlers::{
-        handle_request_body, handle_request_headers, handle_response_body, handle_response_headers,
+        handle_request_body, handle_request_headers, handle_response_body, handle_response_headers, handle_trailers,
         local_reply_passthrough,
     },
     metrics,
-    protocol::{EosTracker, PhaseOrderTracker, ProtocolConfig, request_type_label, validate_body_message},
-    response,
+    protocol::{
+        EosTracker, PhaseOrderTracker, ProtocolConfig, ProtocolPhase, request_type_label, validate_body_message,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -65,6 +66,9 @@ pub struct PraxisExtProc {
     force_shutdown: watch::Receiver<bool>,
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     max_body_accumulation: Option<usize>,
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    trust_forwarded_for: bool,
 }
 
 impl PraxisExtProc {
@@ -82,6 +86,7 @@ impl PraxisExtProc {
             pipeline,
             force_shutdown: rx,
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
+            trust_forwarded_for: false,
         }
     }
 
@@ -96,6 +101,19 @@ impl PraxisExtProc {
     #[must_use]
     pub fn with_max_body_accumulation(mut self, limit: Option<usize>) -> Self {
         self.max_body_accumulation = limit;
+        self
+    }
+
+    /// Trust `x-forwarded-for` for the client address when Envoy's trusted
+    /// `x-envoy-external-address` header is absent.
+    ///
+    /// Defaults to `false`; enable only behind a trusted ingress that strips
+    /// client-supplied `x-forwarded-for` and writes the verified client address
+    /// as the header's sole entry, otherwise the leftmost entry is
+    /// client-spoofable.
+    #[must_use]
+    pub fn with_trust_forwarded_for(mut self, trust: bool) -> Self {
+        self.trust_forwarded_for = trust;
         self
     }
 }
@@ -129,12 +147,13 @@ impl ExternalProcessor for PraxisExtProc {
         let pipeline = Arc::clone(&self.pipeline);
         let force = self.force_shutdown.clone();
         let max_body = self.max_body_accumulation;
+        let trust_forwarded_for = self.trust_forwarded_for;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(RESPONSE_CHANNEL_SIZE);
 
         tokio::spawn(async move {
             tokio::select! {
-                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body)) => {
+                r = Box::pin(handle_stream(&pipeline, &mut inbound, &tx, max_body, trust_forwarded_for)) => {
                     if let Err(e) = r {
                         error!(error = %e, "stream processing failed");
                         drop(tx.send(Err(e)).await);
@@ -169,10 +188,12 @@ async fn handle_stream(
     inbound: &mut Streaming<ProcessingRequest>,
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     max_body: Option<usize>,
+    trust_forwarded_for: bool,
 ) -> Result<(), Status> {
     let start = Instant::now();
     let mut stream_state = StreamState::new();
     stream_state.max_body_accumulation = max_body;
+    stream_state.trust_forwarded_for = trust_forwarded_for;
 
     let result = process_messages(pipeline, inbound, tx, &mut stream_state).await;
 
@@ -294,8 +315,8 @@ async fn dispatch_request(
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
         processing_request::Request::ResponseHeaders(h) => handle_response_headers(pipeline, h, state).await,
         processing_request::Request::ResponseBody(b) => handle_response_body(pipeline, b, state).await,
-        processing_request::Request::RequestTrailers(_) => Ok(vec![response::request_trailers()]),
-        processing_request::Request::ResponseTrailers(_) => Ok(vec![response::response_trailers()]),
+        processing_request::Request::RequestTrailers(_) => handle_trailers(pipeline, state, true).await,
+        processing_request::Request::ResponseTrailers(_) => handle_trailers(pipeline, state, false).await,
     }
 }
 
@@ -473,6 +494,10 @@ pub(crate) struct StreamState {
 
     /// Effective body-accumulation ceiling in bytes; `None` means unbounded.
     pub(crate) max_body_accumulation: Option<usize>,
+
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    pub(crate) trust_forwarded_for: bool,
 }
 
 impl Default for StreamState {
@@ -493,6 +518,7 @@ impl Default for StreamState {
             deferred_response_header_mutation: None,
             phase_order: PhaseOrderTracker::default(),
             max_body_accumulation: None,
+            trust_forwarded_for: false,
         }
     }
 }
@@ -508,6 +534,30 @@ impl StreamState {
             max_body_accumulation: Some(crate::config::DEFAULT_MAX_BODY_BYTES),
             ..Default::default()
         }
+    }
+
+    /// Whether a direction's body phase is still open — headers were received but
+    /// neither the headers nor the body phase has run the pipeline yet.
+    ///
+    /// True only when trailers, not a body message, will close the body: the
+    /// pipeline has held back its work and must be released now.
+    pub(crate) fn body_open(&self, is_request: bool) -> bool {
+        let (present, headers, body) = if is_request {
+            (
+                self.request.is_some(),
+                ProtocolPhase::RequestHeaders,
+                ProtocolPhase::RequestBody,
+            )
+        } else {
+            (
+                self.response.is_some(),
+                ProtocolPhase::ResponseHeaders,
+                ProtocolPhase::ResponseBody,
+            )
+        };
+        present
+            && !self.eos_tracker.phase_state(headers).is_complete()
+            && !self.eos_tracker.phase_state(body).is_complete()
     }
 }
 

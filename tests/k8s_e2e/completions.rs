@@ -207,6 +207,20 @@ async fn multi_turn_conversation() {
 async fn large_body_passthrough() {
     ensure_gateway_ready().await;
     let large_content = "x".repeat(100_000);
+    // Deterministic large-body passthrough on the in-cluster model: its throughput
+    // is predictable regardless of how much concurrent traffic the suite drives.
+    let resp = chat_completion("granite-8b", &large_content).await;
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn large_body_passthrough_external() {
+    ensure_gateway_ready().await;
+    let large_content = "x".repeat(100_000);
+    // Keep a large-body case on the external route: the direct/routing tests only
+    // send short prompts, so this preserves large-body coverage end-to-end on the
+    // external provider path.
     let resp = chat_completion("gpt-4", &large_content).await;
 
     assert_eq!(resp.status(), 200);

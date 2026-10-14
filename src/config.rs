@@ -88,6 +88,18 @@ pub struct ServerConfig {
     /// entirely.
     #[serde(default)]
     pub max_body_bytes: MaxBodyBytes,
+
+    /// Whether to derive the client address from `x-forwarded-for` when Envoy's
+    /// trusted `x-envoy-external-address` header is absent.
+    ///
+    /// Defaults to `false`: the leftmost `x-forwarded-for` entry is
+    /// client-supplied and spoofable. Enable it only behind a trusted ingress
+    /// that strips any client-supplied `x-forwarded-for` and writes the verified
+    /// client address as the header's sole entry; otherwise leave it disabled.
+    /// When `false`, an absent trusted header leaves the client address unset
+    /// rather than trusting attacker-controlled input.
+    #[serde(default)]
+    pub trust_forwarded_for: bool,
 }
 
 impl Default for ServerConfig {
@@ -99,6 +111,7 @@ impl Default for ServerConfig {
             tls: crate::tls::TlsConfig::default(),
             shutdown_drain_timeout_secs: DrainTimeoutSecs::default(),
             max_body_bytes: MaxBodyBytes::default(),
+            trust_forwarded_for: false,
         }
     }
 }
@@ -229,11 +242,14 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
     let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
+
     pipeline
         .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
     pipeline.apply_insecure_options(&config.insecure_options);
+
     #[cfg(feature = "responses-store")]
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
 
@@ -456,13 +472,34 @@ filter_chains:
     }
 
     #[test]
+    fn allow_private_upstreams_is_applied_to_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+
+insecure_options:
+  allow_private_upstreams: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert!(pipeline.allow_private_upstreams());
+    }
+
+    #[test]
     fn build_pipeline_with_ai_filter() {
         let cfg: ExtProcConfig = serde_yaml::from_str(
             r#"
 filter_chains:
   - name: main
     filters:
-      - filter: model_to_header
+      - filter: llmisvc_model_provider_resolver
         header: X-AI-Model
 "#,
         )
@@ -472,6 +509,27 @@ filter_chains:
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 1, "pipeline should have one AI filter");
+    }
+
+    #[test]
+    fn build_pipeline_defaults_private_upstreams_closed() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert!(
+            !pipeline.allow_private_upstreams(),
+            "private upstreams must stay closed unless explicitly opted in"
+        );
     }
 
     #[test]
