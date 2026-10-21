@@ -25,17 +25,15 @@
 # or migration-checksum crypto, so both stay in. CARGO_FEATURES defaults to
 # the Makefile's FIPS_FEATURES; keep the two in sync.
 #
-# Both base images are pinned by digest and their Red Hat signatures are
-# verified by `make fips-verify-image` before any podman build here. Update
-# the digests here and in the Makefile together, after
-# `cargo xtask fips verify-image` has accepted the new ones.
+# Both base images are pinned by digest. Update the digests here and in the
+# Makefile together.
 #
 # Run:
 #   podman run -p 50051:50051 -p 50052:50052 -p 9090:9090 \
 #     -v $(pwd)/examples/praxis-extproc.yaml:/etc/praxis/extproc.yaml \
 #     praxis-extproc:dev -c /etc/praxis/extproc.yaml
 
-ARG UBI9_DIGEST=sha256:beba9460df08acc9f2d5a99f61b8544d5367b05e02c945ca726c6f07ca5963a7
+ARG UBI9_DIGEST=sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
 ARG UBI9_MINIMAL_DIGEST=sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
 
 # Mirrors FIPS_FEATURES in the Makefile.
