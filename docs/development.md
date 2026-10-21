@@ -8,9 +8,9 @@ Praxis ExtProc.
 - Rust stable 1.96+ (edition 2024)
 - Rust nightly (for `rustfmt`; `group_imports` and
   `imports_granularity` are nightly-only)
-- Docker or Podman (container builds; the FIPS checks,
-  the base image signature verification and Red Hat's
-  scanner need Podman on Linux)
+- Docker or Podman (container builds; FIPS image build,
+  smoke, and scan targets, including Red Hat's
+  check-payload scanner, need Podman on Linux)
 - Go 1.26+ and the OpenShift CLI `oc` (`make fips-scanner`,
   `make fips-scan`; optional)
 - [KIND] (local Kubernetes testing)
@@ -48,7 +48,8 @@ cargo test -- test_name
 src/
   lib.rs               # Crate root, module declarations
   bin/
-    praxis_extproc.rs  # Binary entry point, CLI, startup
+    praxis_extproc.rs  # Product binary (registers e2e_body_oracle with k8s-e2e)
+  e2e/                 # Non-production: body oracle (compiled with --features k8s-e2e)
   adapter.rs           # ExtProc ↔ Praxis type translation
   config.rs            # YAML config loading, pipeline build
   error.rs             # Error types (thiserror)
@@ -59,12 +60,13 @@ src/
   tls.rs               # TLS configuration
   fips.rs              # The crypto provider, FIPS signals, PRAXIS_REQUIRE_FIPS
 xtask/
-  src/fips/            # cargo xtask fips: report, verify-image, signature-store
-  assets/fips/         # Red Hat's release key, its signature store entry
+  src/fips/            # cargo xtask fips: report, host-check, runtime-probe
+  assets/fips/         # FIPS provider config, certified modules, OpenSSL symbol list
 tests/
   grpc_server.rs       # In-process gRPC server tests
   services.rs          # Health and metrics service tests
   integration.rs       # Kubernetes integration tests
+  k8s_e2e/             # Black-box e2e tests (feature k8s-e2e), incl. body-oracle
 examples/
   praxis-extproc.yaml  # Example ExtProc configuration
   envoy.yaml           # Example Envoy configuration
@@ -199,16 +201,19 @@ binary links UBI9 `libcrypto.so.3`) and
 `ubi9/ubi-minimal` at runtime, which already ships
 `openssl-libs` and the FIPS provider module; nothing
 is installed into it. Both bases are pinned by digest
-and, with podman, their Red Hat signatures are
-verified before every build. The release build embeds
+via Makefile `FIPS_UBI9_DIGEST` / `FIPS_UBI9_MINIMAL_DIGEST`
+build-args. The release build embeds
 the list of compiled crates with cargo-auditable, from
 cargo's SBOM precursor, which Red Hat's scanner reads.
 Cargo is invoked with `--ignore-rust-version` because
 Red Hat's toolset trails the declared rust-version.
 Builds for the host architecture. The runtime image
 runs as UID 1001 (OpenShift-friendly numeric non-root
-user). Konflux (`.tekton/`) builds the same file with
+user). ODH Konflux (`.tekton/`) builds `Containerfile` with
 its defaults, which are the FIPS feature set.
+`Dockerfile.konflux` matches that builder and runtime for
+downstream Konflux; keep it in sync when you change the
+product image recipe (see [FIPS](fips.md#midstream-vs-downstream-container-files)).
 
 ## CI
 
@@ -230,13 +235,21 @@ warnings fatal.
 
 
 
-## Extended e2e qualification tier
+## K8s e2e body-oracle qualification
 
-Long-running scenarios from
+The two-hop request-body SHA-256 oracle from
 [proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
-(`ai`/`opendatahub-io` issue
-[#27](https://github.com/opendatahub-io/praxis-extproc/issues/27)).
-These stay out of default PR CI.
+(issue [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27))
+lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
+`praxis-extproc` image with `--features k8s-e2e` (same product binary; the
+non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
+registered only under that feature), and `make e2e-test` exercises it through
+`tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
+
+## Extended e2e qualification tier (idle / TLS)
+
+Long-running idle and TLS/mTLS scenarios from proposal #27 stay out of default
+PR CI (tracked in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132)):
 
 ```console
 make e2e-setup-extended   # baseline Forge e2e + e2e-extended overlay + TLS positive
@@ -251,17 +264,16 @@ rewrites Praxis `provided` TLS ConfigMaps, and patches the live
 explicit SAN match (`hack/patch-e2e-extended-upstream-tls.py`). Generated PEMs
 under `deploy/overlays/e2e-extended/tls/**/certs/` are gitignored.
 
-Environment knobs:
-
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `QUALIFICATION_IDLE_SECS` | `300` | Default idle wait when a matrix cell omits `idle_secs` |
 | `E2E_EXTENDED_PROFILE` | `maas_two_hop_fd_streamed` | Topology inventory selection |
 | `GATEWAY_URL` | (auto) | Same as baseline k8s-e2e |
 
-Artifacts land under `target/e2e-extended/report.json`. Release runs use
+Optional artifacts under `target/e2e-extended/`. Release / manual runs use
 `workflow_dispatch` on `.github/workflows/ci-k8s-e2e.yaml` with
-`run_extended=true` (job timeout 120 minutes).
+`run_extended=true` (job timeout 120 minutes). Envoy/Istio versions are pinned
+in forge — the suite does not scrape cluster version metadata.
 
 ## FIPS Tooling
 
@@ -279,8 +291,6 @@ by a Makefile target; the same report runs inside the
 | Command | Makefile | Purpose |
 |---|---|---|
 | `cargo xtask fips report [--deps-only] [--features LIST] [--offline] [--out FILE] [BINARY]` | `fips-deps`, `fips-report`, `fips-check` | The compliance report: environment, dependency graph, binary structure, source guards, with a reason and a pointer for every finding. Exit status 1 while findings remain. |
-| `cargo xtask fips verify-image REFERENCE` | `fips-verify-image` (run by `container-release` under podman and by `fips-check` first) | Refuses any base image that is not digest-pinned, from `registry.access.redhat.com`, and signed by Red Hat's release key. |
-| `cargo xtask fips signature-store [--install]` | `fips-signature-store` | Whether podman's `registries.d` names Red Hat's signature store, without which every Red Hat image looks unsigned; `--install` adds the bundled entry for the current user on hosts whose podman packaging ships none (Debian, Ubuntu, GitHub's runners). CI runs it before `fips-verify-image`. |
 | `check-payload scan image ...` | `fips-scanner`, `fips-scan` | Red Hat's own scanner at a pinned revision, run against the image with warnings fatal: the actual gate. |
 
 The Makefile targets, in the order CI runs them:
@@ -288,8 +298,6 @@ The Makefile targets, in the order CI runs them:
 ```console
 make fips-deps           # dependency graph vs the denylist (seconds, no build)
 make fips-scanner        # build check-payload at its pinned revision (needs Go)
-make fips-signature-store  # once on Debian/Ubuntu hosts
-make fips-verify-image   # the pinned UBI 9 bases are Red Hat's (digest + signature)
 make fips-check          # build on UBI 9 with Red Hat's toolchain, print the report
 make container-release   # the product image
 make fips-smoke          # run it once: the example config validates
@@ -313,12 +321,19 @@ build, and `fips-report` runs the report against
 2. **Binary**: links the system `libcrypto.so.3`
    dynamically, defines no symbol of a bundled crypto
    backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
-   `OPENSSL_`), imports OpenSSL, carries the
-   cargo-auditable manifest (`.dep-v0`, built from
-   cargo's SBOM precursor, listing no denied crate) and
-   the rustc producer string. A binary that is missing,
-   unreadable or not an ELF file is a finding, not a
-   skipped check.
+   `OPENSSL_`), imports its cryptography from the system
+   OpenSSL and imports only reviewed OpenSSL symbols —
+   every `name@OPENSSL_version` symbol it imports is on
+   the reviewed allowlist in
+   `xtask/assets/fips/openssl-nondeprecated-symbols.txt`
+   (every non-deprecated libcrypto/libssl export through
+   OpenSSL 3.5), so an unlisted or deprecated versioned
+   OpenSSL import, or a binary with no GNU symbol-version
+   table, is a finding — carries the cargo-auditable
+   manifest (`.dep-v0`, built from cargo's SBOM
+   precursor, listing no denied crate) and the rustc
+   producer string. A binary that is missing, unreadable
+   or not an ELF file is a finding, not a skipped check.
 3. **Source guards**: the application never enables a
    FIPS provider itself, never uses OpenSSL's legacy
    (non-provider) digest API, never vendors or
@@ -330,8 +345,6 @@ From `xtask/assets/fips/`:
 
 | File | Purpose |
 |---|---|
-| `redhat-release-key-2.asc` | Red Hat, Inc. (release key 2), the GPG key Red Hat signs its container images with. Downloaded on 2026-09-22 from `https://access.redhat.com/security/data/fd431d51.txt`; its fingerprint, `567E 347A D004 4ADE 55BA 8A5F 199E 2F91 FD43 1D51`, matches the one Red Hat publishes at `https://access.redhat.com/security/team/key`. `verify-image` recomputes the fingerprint on every run (RFC 4880 v4, in Rust) and refuses to proceed if it differs; `cargo test -p xtask` checks the same. podman's own signature check needs gnupg installed. |
-| `registry.access.redhat.com.yaml` | The `registries.d` entry that tells podman where Red Hat's signature store is. podman reads only its own `registries.d` (`~/.config/containers/registries.d` when it exists, else `/etc/containers/registries.d`); Fedora and RHEL ship the same entry in containers-common, Debian and Ubuntu ship no `registries.d` at all, which `make fips-signature-store` fixes for the current user. |
 | `fips-provider.cnf` | An `OPENSSL_CONF` that activates the RHEL FIPS provider for one process, used by the report to probe FIPS behaviour on hosts that are not in FIPS mode. Test infrastructure only; the application never enables FIPS itself. |
 
 ### cargo-auditable and cargo's SBOM precursor
@@ -404,10 +417,9 @@ The digests live in the `Makefile` (`FIPS_UBI9_DIGEST`,
 
 ```console
 curl -sI -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json'   https://registry.access.redhat.com/v2/ubi9/ubi/manifests/latest | grep -i docker-content-digest
-cargo xtask fips verify-image registry.access.redhat.com/ubi9/ubi@sha256:<new digest>
 ```
 
-Only update both places once the verification passes.
+Update `FIPS_UBI9_DIGEST` / `FIPS_UBI9_MINIMAL_DIGEST` in the `Makefile` and the matching `ARG` defaults in the `Containerfile` (and `Dockerfile.konflux` for the builder digest).
 
 ## Project Management
 

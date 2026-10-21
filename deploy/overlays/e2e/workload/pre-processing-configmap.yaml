@@ -14,8 +14,18 @@ data:
     filter_chains:
       - name: bbr
         filters:
-          - filter: model_to_header
-            header: X-Gateway-Model-Name
+          # Promote body "model" into X-Gateway-Model-Name; `unless` trusts an
+          # existing header. For untrusted ingress, drop it and strip the header
+          # with `headers request_remove` before json_body.
+          - filter: json_body
+            conditions:
+              - unless:
+                  headers_present: ["X-Gateway-Model-Name"]
+            request_extract:
+              - pointer: /model
+                header: X-Gateway-Model-Name
+            on_invalid: continue
+          - filter: e2e_body_oracle
 
     insecure_options:
       allow_unbounded_body: true

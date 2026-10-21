@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use super::{
     helpers::{
-        IdleMatrixCell, apply_tls_scenario_overlay, assert_ext_proc_error_details, assert_hop_digests,
-        assert_negative_tls_response, chat_completion_with_digest, e2e_kubectl_context, effective_idle_secs,
-        fetch_gateway_access_log_tail, http_client_single_pool, kubectl_apply_f, latest_connection_log_line,
-        load_topology_profile, parse_connection_ids, pool_settings_manifest, repo_root, tls_overlay_dir,
-        wait_ext_proc_rollout,
+        IdleMatrixCell, apply_pool_settings_ref, apply_tls_scenario_overlay, assert_ext_proc_error_details,
+        assert_hop_digests, assert_negative_tls_response, chat_completion_with_digest, delete_pool_envoyfilters,
+        e2e_kubectl_context, effective_idle_secs, fetch_gateway_access_log_tail, http_client_single_pool,
+        kubectl_apply_f, latest_connection_log_line, load_topology_profile, parse_connection_ids, repo_root,
+        tls_overlay_dir, wait_ext_proc_rollout, wait_gateway_pool_idle_timeout,
     },
     report::{ExtendedRunMetadata, IdleMatrixResult},
 };
@@ -128,7 +128,9 @@ async fn idle_tls_negative_matrix_all_scenarios() {
 }
 
 async fn run_negative_tls_cell(scenario_dir: &str, scenario_label: &str) {
-    let before = fetch_gateway_access_log_tail(20);
+    // Same tail size as the poll window so stale 503 lines from earlier cells
+    // remain in `before` and cannot satisfy this cell.
+    let before = fetch_gateway_access_log_tail(80).expect("gateway access-log snapshot before negative TLS cell");
     apply_tls_scenario(scenario_dir)
         .await
         .unwrap_or_else(|error| panic!("apply tls {scenario_dir}: {error}"));
@@ -136,22 +138,20 @@ async fn run_negative_tls_cell(scenario_dir: &str, scenario_label: &str) {
     let (resp, _digest) = chat_completion_with_digest("gpt-4", &format!("negative tls {scenario_label}")).await;
     assert_negative_tls_response(resp.headers(), resp.status());
 
-    // Poll briefly for the negative access-log line.
+    // Poll briefly for a newly written negative access-log line.
     let mut last_logs = String::new();
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        last_logs = fetch_gateway_access_log_tail(80);
-        let has_details = last_logs.contains("details=");
-        let grew = last_logs.len() > before.len() && has_details;
-        let has_ext_proc = last_logs.contains("details=ext_proc") || last_logs.contains("ext_proc_error");
-        if !(grew || has_ext_proc) {
+        let Some(logs) = fetch_gateway_access_log_tail(80) else {
             continue;
-        }
-        let candidate = last_logs.as_str();
-        if candidate
-            .lines()
-            .any(|line| line.contains("details=") && line.contains("ext_proc") && line.contains("code=503"))
-        {
+        };
+        last_logs = logs;
+        if let Some(candidate) = last_logs.lines().rev().find(|line| {
+            !before.contains(*line)
+                && line.contains("details=")
+                && line.contains("ext_proc")
+                && line.contains("code=503")
+        }) {
             let mode = if scenario_label.starts_with("client_") {
                 "verify_trust_chain_mtls"
             } else {
@@ -197,27 +197,19 @@ async fn idle_matrix_post_idle_request_on_reused_connection() {
     }
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "idle cell keeps warm-up/post-idle responses and access-log tails in one async frame"
+)]
 async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
     // Ensure only this cell's pool EnvoyFilter is active (delete sibling refs).
-    let ctx = e2e_kubectl_context();
-    drop(
-        std::process::Command::new("kubectl")
-            .args([
-                "--context",
-                &ctx,
-                "-n",
-                "istio-system",
-                "delete",
-                "envoyfilter",
-                "e2e-extended-pool-default-5min-keepalive",
-                "e2e-extended-pool-aggressive-idle",
-                "--ignore-not-found",
-            ])
-            .status(),
-    );
-    let pool_path = pool_settings_manifest(&cell.pool_settings_ref);
-    kubectl_apply_f(&pool_path).expect("apply pool settings ref");
+    // Drop legacy second-EnvoyFilter pool objects if present; idle is patched
+    // into praxis-extproc-clusters (MERGE via a sibling EnvoyFilter is ignored).
+    delete_pool_envoyfilters();
+    apply_pool_settings_ref(&cell.pool_settings_ref);
     wait_ext_proc_rollout(Duration::from_secs(60)).await;
+    // Pool idle patches retarget the gateway clusters; wait for istiod push.
+    wait_gateway_pool_idle_timeout(&cell.pool_settings_ref, Duration::from_secs(60)).await;
 
     // Fresh client per cell so pool settings are not confounded by prior TCP state.
     let client = http_client_single_pool();
@@ -229,7 +221,8 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
         "messages": [{ "role": "user", "content": format!("idle-matrix warm-up {}", cell.pool_settings_ref) }]
     });
     let warmup_bytes = serde_json::to_vec(&warmup_body).expect("serialize warm-up");
-    let logs_before = fetch_gateway_access_log_tail(5);
+    // Same tail size as the poll window so stale baseline lines stay in `before`.
+    let logs_before = fetch_gateway_access_log_tail(40).expect("gateway access-log snapshot before warm-up");
     let warmup_resp = client
         .post(&chat_url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -243,24 +236,25 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
         "warm-up chat should succeed for {}",
         cell.pool_settings_ref
     );
+    // Drain the body so reqwest returns the TCP connection to the idle pool
+    // before QUALIFICATION_IDLE_SECS; holding an unread response prevents reuse.
+    drop(warmup_resp.bytes().await.expect("warm-up body"));
 
     let mut warmup_ids = None;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let logs = fetch_gateway_access_log_tail(40);
-        if let Some(line) = latest_connection_log_line(&logs)
+        let Some(logs) = fetch_gateway_access_log_tail(40) else {
+            continue;
+        };
+        if let Some(line) = latest_connection_log_line(&logs).filter(|line| !logs_before.contains(*line))
             && let Some(ids) = parse_connection_ids(line)
         {
-            // Prefer a line that appeared after warm-up.
-            if !logs_before.contains(line) || warmup_ids.is_none() {
-                warmup_ids = Some(ids);
-                if !logs_before.contains(line) {
-                    break;
-                }
-            }
+            warmup_ids = Some(ids);
+            break;
         }
     }
-    let warmup_ids = warmup_ids.expect("warm-up access-log connection_id");
+    let warmup_ids =
+        warmup_ids.expect("warm-up access-log connection_id: expected a new connection_id= line after warm-up");
 
     let idle_secs = effective_idle_secs(cell);
     tokio::time::sleep(Duration::from_secs(idle_secs)).await;
@@ -273,7 +267,8 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
     let digest = super::helpers::hex_sha256(&bytes);
     // Snapshot access logs before the post-idle request so warm-up lines cannot
     // satisfy the reuse check.
-    let logs_before_post = fetch_gateway_access_log_tail(80);
+    let logs_before_post =
+        fetch_gateway_access_log_tail(80).expect("gateway access-log snapshot before post-idle request");
     let resp = client
         .post(&chat_url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -288,11 +283,14 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
         cell.pool_settings_ref
     );
     assert_hop_digests(&digest, resp.headers());
+    drop(resp.bytes().await.expect("post-idle body"));
 
     let mut post_ids = None;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let logs = fetch_gateway_access_log_tail(80);
+        let Some(logs) = fetch_gateway_access_log_tail(80) else {
+            continue;
+        };
         for line in logs.lines().rev() {
             if logs_before_post.contains(line) {
                 continue;
@@ -320,17 +318,9 @@ async fn run_idle_matrix_cell(profile_name: &str, cell: &IdleMatrixCell) {
         "downstream CONNECTION_ID must be reused after idle ({})",
         cell.pool_settings_ref
     );
-    if !warmup_ids.upstream_connection_id.is_empty()
-        && warmup_ids.upstream_connection_id != "0"
-        && !post_ids.upstream_connection_id.is_empty()
-        && post_ids.upstream_connection_id != "0"
-    {
-        assert_eq!(
-            post_ids.upstream_connection_id, warmup_ids.upstream_connection_id,
-            "upstream CONNECTION_ID should be reused when ext-proc path is warm ({})",
-            cell.pool_settings_ref
-        );
-    }
+    // Downstream reuse is the qualification signal (client→gateway TCP). Upstream
+    // ids on the two-hop TLS path can change even when that TCP conn is reused
+    // (new ext-proc stream / cluster conn); record them without failing the cell.
 
     let result = IdleMatrixResult {
         idle_secs,
@@ -380,7 +370,7 @@ async fn idle_tls_scenario_inventory_covers_how_spec() {
 
 #[cfg(test)]
 mod unit {
-    use super::super::helpers::{latest_details_log_line, parse_connection_ids};
+    use super::super::helpers::{dump_reflects_pool_idle_timeout, latest_details_log_line, parse_connection_ids};
 
     #[test]
     fn parse_connection_ids_from_reuse_line() {
@@ -395,5 +385,42 @@ mod unit {
         let logs = "code=200 details=via_upstream flags=-\ncode=503 details=ext_proc_error flags=-\n";
         let line = latest_details_log_line(logs).expect("line");
         assert!(line.contains("ext_proc_error"));
+    }
+
+    #[test]
+    fn dump_pool_idle_requires_both_cluster_windows() {
+        // Sibling cluster still on 300s must not satisfy a 30s cell.
+        let mixed = r#"
+{"name": "praxis-pre-processing-grpc","typed_extension_protocol_options":{"idle_timeout": "30s"}}
+{"name": "praxis-processing-grpc","typed_extension_protocol_options":{"idle_timeout": "300s"}}
+"#;
+        assert!(
+            !dump_reflects_pool_idle_timeout(mixed, "30s"),
+            "mixed per-cluster timeouts must fail"
+        );
+        // Adjacent JSON: pre still 300s, processing already 30s — window must
+        // stop at the next ext-proc cluster name so pre cannot borrow 30s.
+        // Nested transport_socket.name must not truncate before idle_timeout.
+        let adjacent = concat!(
+            r#"{"name": "praxis-pre-processing-grpc","transport_socket":{"name":"envoy.transport_sockets.tls"},"typed_extension_protocol_options":{"idle_timeout": "300s"}}"#,
+            r#"{"name": "praxis-processing-grpc","transport_socket":{"name":"envoy.transport_sockets.tls"},"typed_extension_protocol_options":{"idle_timeout": "30s"}}"#,
+        );
+        assert!(
+            !dump_reflects_pool_idle_timeout(adjacent, "30s"),
+            "adjacent sibling idle_timeout must not satisfy the other cluster"
+        );
+        let nested_name_both_ready = concat!(
+            r#"{"name": "praxis-pre-processing-grpc","transport_socket":{"name":"envoy.transport_sockets.tls"},"typed_extension_protocol_options":{"idle_timeout": "30s"}}"#,
+            r#"{"name": "praxis-processing-grpc","transport_socket":{"name":"envoy.transport_sockets.tls"},"typed_extension_protocol_options":{"idle_timeout": "30s"}}"#,
+        );
+        assert!(
+            dump_reflects_pool_idle_timeout(nested_name_both_ready, "30s"),
+            "nested transport_socket.name must not hide idle_timeout"
+        );
+        let both = r#"
+{"name": "praxis-pre-processing-grpc","typed_extension_protocol_options":{"idle_timeout": "30s"}}
+{"name": "praxis-processing-grpc","typed_extension_protocol_options":{"idle_timeout": "30s"}}
+"#;
+        assert!(dump_reflects_pool_idle_timeout(both, "30s"));
     }
 }

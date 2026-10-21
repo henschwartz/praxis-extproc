@@ -263,10 +263,18 @@ pub(crate) fn gateway_pod_names() -> Vec<String> {
 }
 
 /// Tail recent stdout logs from all gateway pods (joined).
-pub(crate) fn fetch_gateway_access_log_tail(tail_lines: u32) -> String {
+///
+/// Returns `None` when every `kubectl logs` call fails so poll loops can
+/// retry without treating an empty snapshot as a valid `before` baseline.
+pub(crate) fn fetch_gateway_access_log_tail(tail_lines: u32) -> Option<String> {
     let ctx = e2e_kubectl_context();
+    let pods = gateway_pod_names();
+    if pods.is_empty() {
+        return None;
+    }
     let mut combined = String::new();
-    for pod in gateway_pod_names() {
+    let mut any_ok = false;
+    for pod in pods {
         let output = Command::new("kubectl")
             .args([
                 "--context",
@@ -280,10 +288,14 @@ pub(crate) fn fetch_gateway_access_log_tail(tail_lines: u32) -> String {
             ])
             .output()
             .unwrap_or_else(|error| panic!("kubectl logs {pod}: {error}"));
+        if !output.status.success() {
+            continue;
+        }
+        any_ok = true;
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
         combined.push('\n');
     }
-    combined
+    any_ok.then_some(combined)
 }
 
 /// Parse `connection_id=` / `upstream_connection_id=` from an access-log line.
@@ -329,14 +341,15 @@ pub(crate) fn assert_negative_tls_response(headers: &HeaderMap, status: reqwest:
     );
 }
 
-/// Assert access-log details mention `ext_proc` (not bare UF).
-pub(crate) fn assert_ext_proc_error_details(logs: &str) {
-    let line = logs
-        .lines()
-        .rev()
-        .find(|line| line.contains("code=503") && line.contains("details=") && line.contains("ext_proc"))
-        .or_else(|| latest_details_log_line(logs))
-        .expect("expected access-log line with details=");
+/// Assert a single access-log line mentions `ext_proc` (not bare UF).
+///
+/// Callers must pass the candidate line (not a multi-line tail) so a stale
+/// 503 from an earlier negative cell cannot satisfy the assertion.
+pub(crate) fn assert_ext_proc_error_details(line: &str) {
+    assert!(
+        line.contains("code=503") && line.contains("details=") && line.contains("ext_proc"),
+        "expected access-log line with code=503, details=, and ext_proc; got: {line}"
+    );
     let details = capture_field(line, "details=").unwrap_or_default();
     let flags = capture_field(line, "flags=").unwrap_or_default();
     assert!(
@@ -346,6 +359,175 @@ pub(crate) fn assert_ext_proc_error_details(logs: &str) {
     assert!(
         !flags.contains("UF") || details.contains("ext_proc"),
         "misclassified UF without ext_proc details: {line}"
+    );
+}
+
+/// Expected Envoy `idle_timeout` string for a topology `pool_settings_ref`.
+pub(crate) fn expected_pool_idle_timeout(pool_settings_ref: &str) -> &'static str {
+    match pool_settings_ref {
+        "default_5min_keepalive" => "300s",
+        "aggressive_idle" => "30s",
+        other => panic!("unknown pool_settings_ref: {other}"),
+    }
+}
+
+/// Remove legacy per-cell pool `EnvoyFilter`s (pre-patch idle path).
+///
+/// Idle timeouts are now patched into `praxis-extproc-clusters` via
+/// [`apply_pool_settings_ref`]; these names are only cleaned up if an older
+/// checkout left them behind.
+///
+/// # Panics
+///
+/// Panics if `kubectl delete` fails for a reason other than not-found.
+pub(crate) fn delete_pool_envoyfilters() {
+    let ctx = e2e_kubectl_context();
+    let status = Command::new("kubectl")
+        .args([
+            "--context",
+            &ctx,
+            "-n",
+            "istio-system",
+            "delete",
+            "envoyfilter",
+            "e2e-extended-pool-default-5min-keepalive",
+            "e2e-extended-pool-aggressive-idle",
+            "--ignore-not-found",
+        ])
+        .status()
+        .expect("kubectl delete pool envoyfilters");
+    assert!(
+        status.success(),
+        "kubectl delete pool envoyfilters failed with {status}"
+    );
+}
+
+/// Patch `praxis-extproc-clusters` with the idle timeout for `pool_settings_ref`.
+///
+/// # Panics
+///
+/// Panics if the patch helper exits non-zero.
+pub(crate) fn apply_pool_settings_ref(pool_settings_ref: &str) {
+    let manifest = pool_settings_manifest(pool_settings_ref);
+    let status = Command::new("python3")
+        .arg(repo_root().join("hack/patch-e2e-extended-pool-idle.py"))
+        .arg("--context")
+        .arg(e2e_kubectl_context())
+        .arg("--manifest")
+        .arg(&manifest)
+        .status()
+        .unwrap_or_else(|error| panic!("run patch-e2e-extended-pool-idle.py: {error}"));
+    assert!(
+        status.success(),
+        "patch-e2e-extended-pool-idle.py {} failed with {status}",
+        manifest.display()
+    );
+}
+
+/// True when each ext-proc cluster's local dump window shows `idle_timeout`.
+///
+/// Avoids a whole-dump `contains` false positive where one cluster still has
+/// the previous cell's timeout while another already shows the new value.
+pub(crate) fn dump_reflects_pool_idle_timeout(dump: &str, expected: &str) -> bool {
+    ["praxis-pre-processing-grpc", "praxis-processing-grpc"]
+        .iter()
+        .all(|cluster| cluster_window_has_idle_timeout(dump, cluster, expected))
+}
+
+fn cluster_window_has_idle_timeout(dump: &str, cluster: &str, expected: &str) -> bool {
+    let markers = [format!("\"name\": \"{cluster}\""), format!("\"name\":\"{cluster}\"")];
+    // Bound at the next *ext-proc cluster* name — not every JSON `"name"`
+    // (transport_socket.name appears before idle_timeout in real dumps).
+    let sibling_boundaries = [
+        "\"name\": \"praxis-pre-processing-grpc\"",
+        "\"name\":\"praxis-pre-processing-grpc\"",
+        "\"name\": \"praxis-processing-grpc\"",
+        "\"name\":\"praxis-processing-grpc\"",
+    ];
+    let max_window = 6_000_usize;
+    let idle_a = format!("\"idle_timeout\": \"{expected}\"");
+    let idle_b = format!("\"idle_timeout\":\"{expected}\"");
+    for marker in &markers {
+        for (abs, _) in dump.match_indices(marker.as_str()) {
+            let Some(tail) = dump.get(abs.saturating_add(marker.len())..) else {
+                continue;
+            };
+            let next_sibling = sibling_boundaries
+                .iter()
+                .filter_map(|needle| tail.find(needle))
+                .min()
+                .unwrap_or(tail.len());
+            let mut end = next_sibling.min(max_window);
+            while end > 0 && !tail.is_char_boundary(end) {
+                end -= 1;
+            }
+            let Some(window) = tail.get(..end) else {
+                continue;
+            };
+            if window.contains(&idle_a) || window.contains(&idle_b) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Wait until a gateway proxy config dump shows the cell's cluster `idle_timeout`.
+///
+/// Pool `EnvoyFilter`s retarget the gateway, not the ext-proc Deployments, so
+/// [`wait_ext_proc_rollout`] alone is not enough before warm-up.
+///
+/// # Panics
+///
+/// Panics if no gateway pod shows `idle_timeout=<expected>` before `timeout`.
+pub(crate) async fn wait_gateway_pool_idle_timeout(pool_settings_ref: &str, timeout: Duration) {
+    let expected = expected_pool_idle_timeout(pool_settings_ref);
+    let ctx = e2e_kubectl_context();
+    let pods = gateway_pod_names();
+    assert!(!pods.is_empty(), "no e2e-gateway pods to query for pool idle_timeout");
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        for pod in pods.clone() {
+            let ctx = ctx.clone();
+            let expected = expected.to_owned();
+            // Keep kubectl stdout off the async task stack (config_dump is large).
+            let matched = tokio::task::spawn_blocking(move || {
+                let output = Command::new("kubectl")
+                    .args([
+                        "--context",
+                        &ctx,
+                        "-n",
+                        "istio-system",
+                        "exec",
+                        &pod,
+                        "-c",
+                        "istio-proxy",
+                        "--",
+                        "curl",
+                        "-sS",
+                        "--max-time",
+                        "5",
+                        "127.0.0.1:15000/config_dump",
+                    ])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let dump = String::from_utf8_lossy(&output.stdout);
+                Some(dump_reflects_pool_idle_timeout(&dump, &expected))
+            })
+            .await
+            .ok()
+            .flatten();
+            if matched == Some(true) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    panic!(
+        "gateway config dump missing idle_timeout={expected} for pool_settings_ref={pool_settings_ref} within {timeout:?}"
     );
 }
 

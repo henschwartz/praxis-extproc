@@ -3,7 +3,8 @@
 
 //! Qualification-tier helpers compiled only with `--features k8s-e2e`.
 //!
-//! See `docs/proposals/27_extended-e2e-tls-idle-fd-streamed.md` (How?).
+//! Non-production: FIPS/release builds never enable this feature, so the
+//! shipped binary does not register these filters.
 
 pub mod body_oracle;
 

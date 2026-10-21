@@ -24,9 +24,10 @@ goes into it. How the build is checked and how the tooling works is in
 
 The `Containerfile` builds the FIPS feature set by default, on
 `ubi9/ubi` with Red Hat's `rust-toolset` and OpenSSL, and ships on
-`ubi9/ubi-minimal`; both bases are pinned by digest and their Red Hat
-signatures are verified before every podman build here. Konflux builds the
-same file. There is no separate FIPS tag: the image is the FIPS build.
+`ubi9/ubi-minimal`; both bases are pinned by digest in the `Containerfile`
+and Makefile. ODH Konflux builds
+`Containerfile`; downstream mirrors `Dockerfile.konflux` (see below). There
+is no separate FIPS tag: the image is the FIPS build.
 
 The FIPS build differs from a plain `cargo build` only in its cargo features.
 It leaves out what is known to carry pure-Rust cryptography, so nobody has to
@@ -35,45 +36,80 @@ know which features to pick:
 | | `cargo build` (default features) | The image (`FIPS_FEATURES` in the Makefile) |
 |---|---|---|
 | `responses`: the OpenAI Responses filters | yes | yes |
-| `responses-store`: the response store the Responses filters keep state in | yes | no: built on sqlx, whose migration checksums use `sha2` |
-| `responses-full`: the rest of what Praxis AI offers on that store (the Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: all of it needs the store |
-| `aws-sigv4`: the `aws_sigv4_sign` filter | yes | no: signs with `sha2` and `hmac` |
+| `responses-store`: the response store the Responses filters keep state in | yes | yes: through `store-postgres-cert-auth` below -- the praxis-proxy `sqlx` fork it builds on compiles no `sha2` migration checksums |
+| `store-postgres-cert-auth`: the certificate-only (mTLS) Postgres store backend | no (the default takes `responses-full`'s backends) | yes: SQL transport and the client-certificate handshake run through the system OpenSSL, and it compiles no SCRAM, migration-checksum or advisory-lock crypto |
+| `responses-full`: the rest of what Praxis AI offers on that store (the password-auth Postgres and SQLite backends, Conversations, context compaction, MCP tools, the file resolver) | yes | no: the SQLite and password-auth backends bring `sqlx`'s `sha2` and SCRAM's `md-5`/`hmac`/`sha2`/`hkdf`, and the MCP tools pull `aws-lc-rs` |
+| `aws-sigv4`: the `aws_sigv4_sign` filter | yes | yes: signs through the system OpenSSL (praxis-ai moved it off `sha2`/`hmac`; the `aws-sigv4` crate is only its test oracle) |
 | `policy-engine`: the praxis `policy` filter (the Praxis Policy Engine) | yes | no: its runtime and plugins carry `aws-lc-rs`, `sha2` and `hmac` |
 
 `FIPS_FEATURES` is defined once, in the Makefile; the `Containerfile`'s
 `CARGO_FEATURES` default mirrors it.
 
+The image carries the response store through the certificate-only Postgres
+backend (`store-postgres-cert-auth`), the profile praxis-ai's own FIPS image
+ships. SQL transport and the client-certificate (mTLS) handshake run through
+the system OpenSSL, and the praxis-proxy `sqlx` fork it builds on compiles no
+migration checksums, no SCRAM password authentication and no advisory-lock
+hashing, so it pulls none of `sha2`, `hmac` or `md-5`. The default build's
+store instead takes `responses-full`'s password-auth Postgres and SQLite
+backends, which do carry that cryptography, so the default `cargo build` has
+them and the image does not.
+
+### Midstream vs downstream container files
+
+Open Data Hub Konflux (`.tekton/`) builds [`Containerfile`](../Containerfile).
+That file has three stages: builder, an optional `report` stage used only by
+`make fips-check`, and runtime.
+
+[`Dockerfile.konflux`](../Dockerfile.konflux) matches `Containerfile` for digests,
+`CARGO_FEATURES`, and runtime layout, kept in the tree so
+[red-hat-data-services/praxis-extproc](https://github.com/red-hat-data-services/praxis-extproc)
+can mirror it for downstream Konflux. Release builds use plain `cargo` (no
+`cargo-auditable`) so hermetic Konflux does not fetch the tool from crates.io;
+embed the crate manifest via `Containerfile` or `make release-fips` when you need
+check-payload evidence. It has no `report` stage; compliance reports still use
+`make fips-check`, which builds `Containerfile --target report`.
+
+When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe
+in `Containerfile`, or runtime layout, update `Containerfile`, `Dockerfile.konflux`
+(where applicable), and the Makefile digest variables. Keep the `ubi9/ubi`
+builder digest consistent between `Containerfile` and `Dockerfile.konflux`
+(the Konflux runtime uses `ubi-minimal-pqc` on `registry.redhat.io`). To build
+the Konflux file locally:
+
+```console
+podman build -f Dockerfile.konflux .
+```
+
 ## What the FIPS build leaves out, in detail
 
-**The Responses store** (`responses-store`). The Responses filters share a
-response store registry, installed as a pipeline extension, that
-`openai_responses_rehydrate` reads earlier responses from
-(`previous_response_id` chaining) and `openai_response_store` writes finished
-responses to. Without it, stateless Responses requests work as before, and
-a configuration that names those two filters still starts, but a request
-that reaches `openai_responses_rehydrate` is rejected with a 500 ("response
-store is not available") and `openai_response_store` skips persistence.
-What makes it unclean is `sqlx-core`, which depends on `sha2` for its
-migration checksums, and Red Hat's scanner fails on the crate's name alone.
-Fixing it means either an in-memory store in praxis-ai that does not go
-through sqlx, or sqlx making `sha2` optional upstream.
+**The SQLite and password-auth Postgres store backends** (part of
+`responses-full`). The store registry itself ships — the image builds it on the
+certificate-only Postgres backend (see "The product image is the FIPS build"
+above): `sqlx`, `sqlx-core` and `sqlx-postgres` from the praxis-proxy fork,
+which compiles no `sha2` migration checksums, with certificate authentication
+that needs no SCRAM. What the image leaves out are the other backends: the
+SQLite backend (`sqlx-sqlite`, `libsqlite3-sys`) and the password-authenticated
+Postgres backend, whose SCRAM handshake pulls `md-5`, `hmac`, `sha2` and `hkdf`.
+A request that reaches `openai_responses_rehydrate` with no store configured is
+still rejected with a 500 ("response store is not available"); with the shipped
+certificate-only store it is served.
 
-**Everything on the store** (`responses-full`). The Postgres and SQLite
-store backends (`sqlx-postgres` adds `md-5`, `hmac`, `sha2` and `hkdf` of
-its own for SCRAM authentication), the Conversations API
-(`openai_conversations`), context compaction (`openai_responses_compact`),
+**The rest of what rides on the store** (`responses-full`). The Conversations
+API (`openai_conversations`), context compaction (`openai_responses_compact`),
 MCP tool resolution and dispatch (`rmcp`, whose HTTP transport is reqwest
 with its `rustls` feature, which compiles in `aws-lc-rs`), and the file
 resolver (`openai_file_resolve`, the same reqwest). All of them need the
 store, so they go with it; a configuration naming one of those filters is
 rejected at startup by the image. No shipped configuration does.
 
-**The `aws_sigv4_sign` filter** (`aws-sigv4`). AWS Signature V4 request
-signing for Bedrock-style backends. The `aws-sigv4` crate computes the
-signature with `sha2` and `hmac`, both on the denylist. No shipped
-configuration uses the filter. Fixing it means signing through OpenSSL's EVP
-APIs (`openssl::hash`, `openssl::sign`) in praxis-ai instead of the
-`aws-sigv4` crate.
+**The `aws_sigv4_sign` filter** (`aws-sigv4`) is in the FIPS build. AWS
+Signature V4 request signing for Bedrock-style backends. It used to be
+excluded because the `aws-sigv4` crate computes the signature with `sha2`
+and `hmac`, both on the denylist; praxis-ai has since moved the signing
+onto OpenSSL's EVP APIs (`openssl::hash`, `openssl::sign`), keeping the
+`aws-sigv4` crate only as the test oracle the signer is checked against,
+so the filter ships.
 
 **The praxis `policy` filter** (`policy-engine`). The Praxis Policy Engine,
 which praxis-filter builds from the praxis-policy crates
@@ -164,7 +200,6 @@ fatal error=crypto: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: t
 On a developer machine (no FIPS host needed):
 
 ```console
-make fips-signature-store  # once on Debian/Ubuntu: their podman has no entry for Red Hat's signature store
 make fips-check            # build on UBI 9 with Red Hat's toolchain, print the compliance report
 make container-release     # the product image
 make fips-smoke            # run it once: the example config validates with the system OpenSSL
@@ -172,7 +207,34 @@ make fips-scanner          # build Red Hat's scanner (check-payload) at its pinn
 make fips-scan             # run it against the image, warnings fatal
 ```
 
-On the FIPS host, the two things only it can prove:
+On a RHEL 9 host in FIPS mode, the runtime proof (what CI's `fips-host` job
+runs on every change):
+
+```console
+make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
+make test-fips-host      # the test suite as the FIPS build, inside the UBI 9 toolchain image, fail-closed on FIPS mode
+make fips-runtime-probe  # run the product image under PRAXIS_REQUIRE_FIPS=1 and probe its TLS listener
+```
+
+`fips-host-check` states every fact the module's Security Policy requires of
+the host (the kernel flag, `fips=1` on the command line, the `FIPS` crypto
+policy, `fips-mode-setup --check`, the module the host's OpenSSL loads) and
+of the image (the crypto policy podman propagates into it, the build of
+`fips.so` it carries and whether that build is on a CMVP certificate), and
+writes the attestation to `target/fips/` to keep with the deployment record.
+`test-fips-host` runs the suite with `PRAXIS_FIPS_HOST=1`, so a green run
+cannot have happened outside FIPS mode: the FIPS behavior tests
+(`tests/fips/`) then insist on their approved-mode branches, in which the
+OpenSSL listener refuses ChaCha20-only, X25519-only and non-EMS TLS 1.2
+clients and negotiates AES-GCM on the NIST curves. `fips-runtime-probe`
+starts the shipped image itself under `PRAXIS_REQUIRE_FIPS=1`, drives those
+same listener probes against it from outside (including a real ExtProc gRPC
+exchange over the approved TLS), and checks the startup line. The
+cluster-bound suites (`make test-integration` and the k8s e2e tests) are
+not part of the host run; CI drives them in their own jobs, against real
+clusters.
+
+A hand check on the FIPS host remains a two-liner:
 
 ```console
 cat /proc/sys/crypto/fips_enabled                        # 1
@@ -186,10 +248,50 @@ FIPS mode. The startup line above is logged when the real workload starts,
 so run it the same way with `PRAXIS_REQUIRE_FIPS=1` and keep that line as
 evidence; the `fips` health service says the same thing to a probe.
 
-What the local checks cannot prove, and only a FIPS host can: the kernel flag
-and the positive `PRAXIS_REQUIRE_FIPS` path, RHEL's boot-time module
-integrity self-tests, and behaviour under the host-wide `FIPS` crypto policy
-(the local checks activate the provider, not the policy).
+On a developer machine the same behavior tests run their non-approved
+branches, and the approved branches can be exercised without a FIPS host by
+activating the FIPS provider per process:
+
+```console
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="env OPENSSL_CONF=$PWD/xtask/assets/fips/fips-provider.cnf" \
+    cargo test --test fips
+```
+
+That simulates the provider, not the host: only the FIPS host run proves the
+kernel flag, the positive `PRAXIS_REQUIRE_FIPS` path, RHEL's boot-time
+module integrity self-tests, and behaviour under the host-wide `FIPS`
+crypto policy.
+
+## The runner job
+
+The `fips-host` job of the `FIPS` workflow runs on a self-hosted RHEL 9
+runner in FIPS mode, selected by the labels `fips` and `rhel`. It tests the
+exact image the hosted `ubi-image` job built and scanned, handed over as an
+artifact and checked by image id, then runs `make fips-host-check`,
+`make test-fips-host` and `make fips-runtime-probe` through
+`.github/actions/fips-host`, keeping the attestation and the probe log as
+artifacts.
+
+The runner needs `git`, `make`, `podman` (rootless), `gnupg2`, `gcc`,
+`gcc-c++`, `cmake` and `openssl-devel`, checked up front by
+`.github/actions/fips-runner-check`, and must be registered with this
+repository (it lives in a different GitHub organization than the praxis
+runner group, so the same machine needs a runner registration for this
+repository too). The job never runs a fork's code (same-repository pull
+requests only); the runner takes one job at a time, which serializes it
+with the praxis and praxis-ai runs sharing the machine. The first run
+builds the `praxis-extproc-fips-host-*` cache volumes cold and is slow;
+later runs are incremental. Pull requests run before review, so the job
+points them at their own `-pr` volumes (`FIPS_HOST_VOLUME_SUFFIX`) and
+removes those volumes when it ends: the warm ones serve only main, the
+schedule and manual dispatch, and never see what an unreviewed branch
+wrote.
+
+The module build the UBI 9 images currently carry is in validation with
+NIST rather than on an active certificate; `fips-host-check` grades it
+against `xtask/assets/fips/certified-modules.json` and says so as a
+warning. `FIPS_HOST_CHECK_ARGS=--require-certified` turns that into a
+failure for deployments that must not run ahead of the certificate.
 
 ## Scope and exemptions
 
@@ -205,9 +307,9 @@ Every crypto-adjacent component in the image, and why it is compliant:
 | ahash, crc32fast | hash maps, gzip checksums | not security functions |
 | x509-parser (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize | constant-time comparison, wiping | helpers |
-| aws-sigv4 (`aws_sigv4_sign`) | request signing with sha2 and hmac | not in the FIPS build (feature `aws-sigv4`) |
-| sqlx-core (the Responses store) | migration checksums use sha2 | not in the FIPS build (feature `responses-store`) |
-| sqlx-postgres, rmcp, tiktoken-rs (everything on the store) | SCRAM authentication with md-5, hmac, sha2 and hkdf; reqwest with aws-lc-rs behind the MCP client; the tokenizer | not in the FIPS build (feature `responses-full`) |
+| the `aws_sigv4_sign` filter (feature `aws-sigv4`) | AWS Signature V4 request signing | compliant: praxis-ai signs through the system OpenSSL (`openssl::hash`, `openssl::sign`); the `aws-sigv4` crate is only its dev-time test oracle |
+| sqlx, sqlx-core, sqlx-postgres (the certificate-only Postgres store, from the praxis-proxy fork) | SQL transport and the mTLS handshake through the system OpenSSL; the fork compiles no sha2 migration checksums and certificate auth needs no SCRAM | in the FIPS build (feature `store-postgres-cert-auth`), compliant |
+| md-5, hmac, sha2, hkdf (SCRAM for the password-auth Postgres store), sqlx-sqlite, libsqlite3-sys (the SQLite store), rmcp, tiktoken-rs | SCRAM password authentication; the SQLite driver; reqwest with aws-lc-rs behind the MCP client; the tokenizer | not in the FIPS build (feature `responses-full`) |
 | the praxis policy engine (praxis-policy) | its runtime and JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build (feature `policy-engine`) |
 | rcgen, reqwest with native-tls | test fixtures and clients | development only, absent from the shipped binary and its manifest |
 
@@ -217,16 +319,14 @@ defines no symbol of a bundled crypto backend.
 
 ## Status of the dependency pins
 
-The crypto picture above depends on the praxis FIPS work
-([praxis-proxy/praxis#1254]), which no praxis release carries yet. praxis-ai
-is pinned at a `main` that includes its own FIPS work and takes the praxis
-crates through a temporary `[patch.crates-io]` at a commit from that pull
-request. Patches do not carry over to dependents, so `Cargo.toml` repeats
-the same `[patch.crates-io]` (and `deny.toml` allows the praxis git source).
-Ours is the one that applies, to praxis-ai as well, so keep it on
-praxis-ai's revision: praxis-ai is only built and tested against that one.
-Without it, praxis 0.6.0 from crates.io brings back the 0.9 Pingora fork,
-whose rustls crate carries a ring provider, and `make fips-deps` fails. Once
-a praxis release carries the work, drop the patch and bump the versions.
+The crypto picture above began as the praxis FIPS work
+([praxis-proxy/praxis#1254]), which praxis releases have carried since
+0.7.0. The praxis crates now come from crates.io at the same 0.7 spec
+praxis-ai pins, so the `PipelineExtension` types unify, and praxis-ai is
+pinned at its own tagged release, which builds against that spec; the
+temporary `[patch.crates-io]` this section used to describe is gone, and
+`deny.toml` no longer allows a praxis git source. Any praxis before 0.7
+brings back the 0.9 Pingora fork, whose rustls crate carries a ring
+provider, and `make fips-deps` fails on it.
 
 [praxis-proxy/praxis#1254]: https://github.com/praxis-proxy/praxis/pull/1254

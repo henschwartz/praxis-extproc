@@ -1,0 +1,83 @@
+# syntax=docker/dockerfile:1
+
+# Multi-stage build for praxis-extproc (Konflux).
+#
+# Aligned with Containerfile for digests, CARGO_FEATURES, and runtime layout.
+# ODH Konflux (.tekton/) builds Containerfile; red-hat-data-services uses this
+# file for downstream Konflux. Release builds use plain cargo (no cargo-auditable)
+# so hermetic Konflux builds do not need crates.io for the tool install; FIPS
+# manifest checks use Containerfile / make release-fips instead.
+# When digests or CARGO_FEATURES change, update Containerfile, this file, and Makefile.
+#
+# Unlike Containerfile there is no report stage; make fips-check still uses
+# Containerfile --target report. Builder and runtime match Containerfile.
+
+ARG UBI9_DIGEST=sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
+ARG UBI9_MINIMAL_PQC_DIGEST=sha256:b3a0b012de0c578082e1bc5b01c8bc27461b4eeb571a0b1a2b21a07dbd845a62
+
+# Mirrors FIPS_FEATURES in the Makefile and Containerfile.
+ARG CARGO_FEATURES="responses,aws-sigv4,store-postgres-cert-auth"
+ARG CARGO_PROFILE=release
+ARG CARGO_ARGS="--ignore-rust-version"
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+FROM registry.access.redhat.com/ubi9/ubi@${UBI9_DIGEST} AS builder
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        rust-toolset openssl-devel gcc gcc-c++ cmake make \
+    && dnf clean all
+
+ENV OPENSSL_NO_VENDOR=1 \
+    CARGO_HOME=/cargo
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo .cargo
+COPY proto proto
+COPY src src
+COPY xtask xtask
+
+ARG CARGO_FEATURES
+ARG CARGO_PROFILE
+ARG CARGO_ARGS
+
+RUN --mount=type=cache,id=praxis-extproc-registry,target=/cargo/registry \
+    --mount=type=cache,id=praxis-extproc-target,target=/src/target \
+    set -eu; \
+    case "${CARGO_PROFILE}" in \
+      release) \
+        cargo build --release --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/release/praxis-extproc ;; \
+      debug) \
+        cargo build --locked -p praxis-extproc \
+            --no-default-features --features "${CARGO_FEATURES}" ${CARGO_ARGS}; \
+        BIN=target/debug/praxis-extproc ;; \
+      *) echo "unsupported CARGO_PROFILE=${CARGO_PROFILE}" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /out; \
+    cp "${BIN}" /out/praxis-extproc
+
+# ---------------------------------------------------------------------------
+# Runtime
+# ---------------------------------------------------------------------------
+
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc@${UBI9_MINIMAL_PQC_DIGEST} AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/opendatahub-io/praxis-extproc" \
+    org.opencontainers.image.description="Envoy ExtProc server for Praxis filter pipelines (FIPS build on UBI 9)" \
+    org.opencontainers.image.licenses="Apache-2.0"
+
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /out/praxis-extproc /usr/local/bin/praxis-extproc
+
+USER 1001
+
+EXPOSE 50051 50052 9090
+
+ENTRYPOINT ["praxis-extproc"]
+CMD ["-c", "/etc/praxis/extproc.yaml"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Patch live EnvoyFilter/praxis-extproc upstream TLS validation for e2e-extended."""
+"""Patch live EnvoyFilter/praxis-extproc-clusters upstream TLS validation for e2e-extended."""
 
 from __future__ import annotations
 
@@ -78,8 +78,9 @@ def main() -> int:
     client_crt = args.client_crt.read_text() if args.client_crt else None
     client_key = args.client_key.read_text() if args.client_key else None
 
+    # Baseline e2e splits clusters vs ext-proc filters (#131); TLS patches the clusters EF.
     ef = kubectl_json(
-        args.context, "-n", args.namespace, "get", "envoyfilter", "praxis-extproc"
+        args.context, "-n", args.namespace, "get", "envoyfilter", "praxis-extproc-clusters"
     )
     patches = ef.get("spec", {}).get("configPatches") or []
     touched = 0
@@ -101,14 +102,14 @@ def main() -> int:
         print(f"expected to patch 2 clusters, touched={touched}", file=sys.stderr)
         return 1
 
-    # Drop status/resourceVersion noise that can confuse apply.
+    # Drop status / managedFields; keep resourceVersion (required on update).
     ef.pop("status", None)
     md = ef.setdefault("metadata", {})
-    for key in ("resourceVersion", "uid", "creationTimestamp", "generation", "managedFields"):
+    for key in ("uid", "creationTimestamp", "generation", "managedFields"):
         md.pop(key, None)
 
     kubectl_apply(args.context, ef)
-    print(f"patched praxis-extproc upstream TLS validation on {touched} clusters")
+    print(f"patched praxis-extproc-clusters upstream TLS validation on {touched} clusters")
     return 0
 
 

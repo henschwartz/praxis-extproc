@@ -10,12 +10,14 @@
 //!
 //! [`FilterPipeline`]: praxis_filter::FilterPipeline
 
-use std::{collections::HashMap, mem};
+use std::mem;
 
 use bytes::Bytes;
+use http::HeaderMap;
 use praxis_filter::{FilterAction, FilterPipeline, HttpFilterContext, Response};
-use praxis_proto::envoy::service::ext_proc::v3::ProcessingResponse;
+use praxis_proto::envoy::service::ext_proc::v3::{HeaderMutation, ProcessingResponse};
 use tonic::Status;
+use tracing::warn;
 
 use crate::{
     adapter, metrics,
@@ -44,21 +46,22 @@ pub(crate) async fn run_request_pipeline(
     phase: RequestPhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
+    end_of_stream: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
     let original_len = state.request_body.len();
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
+    let body_reject = run_request_body_filters_at_eos(phase, pipeline, &mut ctx, &mut state.request_body).await?;
     if let Some(imm) = body_reject {
         return Ok(vec![response::immediate(imm)]);
     }
@@ -76,6 +79,7 @@ pub(crate) async fn run_request_pipeline(
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.request_body_mode,
+        end_of_stream,
     ))
 }
 
@@ -97,6 +101,7 @@ pub(crate) async fn run_response_pipeline(
     phase: ResponsePhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
+    end_of_stream: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
         metrics::record_invalid_argument("missing_headers", "request");
@@ -108,7 +113,7 @@ pub(crate) async fn run_response_pipeline(
         Status::invalid_argument("response headers not received")
     })?;
 
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
     let original_headers = capture_original_headers(&resp);
     ctx.response_header = Some(&mut resp);
@@ -147,6 +152,7 @@ pub(crate) async fn run_response_pipeline(
         with_content_length(mutation, body, original_len),
         body,
         state.protocol_config.response_body_mode,
+        end_of_stream,
     ))
 }
 
@@ -167,13 +173,15 @@ async fn execute_response_pipeline_and_body_filters(
 
     if should_execute {
         let action = execute_response(pipeline, ctx).await?;
-        if let Some(imm) = check_reject(action) {
+        if let Some(imm) = immediate_from_action(action) {
             return Ok(Some(imm));
         }
     }
 
-    let body_reject = run_resp_body_filters(pipeline, ctx, response_body, true)?;
-    Ok(body_reject)
+    match phase {
+        ResponsePhase::Headers => Ok(None),
+        ResponsePhase::Body => run_resp_body_filters(pipeline, ctx, response_body, true),
+    }
 }
 
 /// Set `content-length` when the emitted body differs in size from the original.
@@ -184,10 +192,10 @@ async fn execute_response_pipeline_and_body_filters(
 /// `allow_content_length_header`; ignored (harmlessly) in `STREAMED`, where Envoy
 /// strips content-length and switches to chunked encoding.
 fn with_content_length(
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     original_len: usize,
-) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+) -> Option<HeaderMutation> {
     match body {
         Some(b) if b.len() != original_len => Some(adapter::set_content_length(mutation, b.len())),
         _ => mutation,
@@ -195,40 +203,47 @@ fn with_content_length(
 }
 
 /// Build request-phase responses, prepending `HeadersResponse` in FDS mode.
+///
+/// `end_of_stream` marks the emitted body chunk final. It is `true` on the normal
+/// body-EOS path and `false` when trailers close the body (the trailers message
+/// ends the stream, and the proto forbids `end_of_stream=true` on a body response
+/// whose request chunk was not itself final).
 fn build_request_for_phase(
     phase: RequestPhase,
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (RequestPhase::Headers, _) => vec![response::request_headers(mutation)],
         (RequestPhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::request_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::request_body(body, None, mode, true));
+            r.extend(response::request_body(body, None, mode, end_of_stream));
             r
         },
-        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, true),
+        (RequestPhase::Body, _) => response::request_body(body, mutation, mode, end_of_stream),
     }
 }
 
 /// Build response-phase responses, prepending `ResponseHeadersResponse` in FDS mode.
+///
+/// See [`build_request_for_phase`] for the meaning of `end_of_stream`.
 fn build_response_for_phase(
     phase: ResponsePhase,
-    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    mutation: Option<HeaderMutation>,
     body: Option<&[u8]>,
     mode: BodyMode,
+    end_of_stream: bool,
 ) -> Vec<ProcessingResponse> {
     match (phase, mode) {
         (ResponsePhase::Headers, _) => vec![response::response_headers(mutation)],
         (ResponsePhase::Body, BodyMode::FullDuplexStreamed) => {
             let mut r = vec![response::response_headers(mutation)];
-            // Assembled body emitted at EOS.
-            r.extend(response::response_body(body, None, mode, true));
+            r.extend(response::response_body(body, None, mode, end_of_stream));
             r
         },
-        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, true),
+        (ResponsePhase::Body, _) => response::response_body(body, mutation, mode, end_of_stream),
     }
 }
 
@@ -261,26 +276,34 @@ pub(crate) fn passthrough_chunk(
         return body_responses;
     }
 
+    let mut responses = vec![deferred_header_response(state, is_request)];
+    responses.extend(body_responses);
+    responses
+}
+
+/// Build a `HeadersResponse` carrying the deferred header-phase mutation.
+///
+/// Consumes the parked `deferred_*_header_mutation` for the direction. Used to
+/// flush a header mutation that was held back to ride out on a body message but
+/// has not yet gone out.
+pub(crate) fn deferred_header_response(state: &mut StreamState, is_request: bool) -> ProcessingResponse {
     let mutation = if is_request {
         state.deferred_request_header_mutation.take()
     } else {
         state.deferred_response_header_mutation.take()
     };
-    let hdr = if is_request {
+    if is_request {
         response::request_headers(mutation)
     } else {
         response::response_headers(mutation)
-    };
-    let mut responses = vec![hdr];
-    responses.extend(body_responses);
-    responses
+    }
 }
 
 /// Process a single body chunk in `STREAMED` mode.
 ///
-/// Runs body filters on the chunk and responds immediately.
-/// Header mutations are sent at header time for `STREAMED`, so
-/// `deferred_*_header_mutation` will be `None` here.
+/// Runs body filters on the chunk and responds immediately. Body filters may
+/// derive header mutations from the body, so collect them from the filter
+/// context and merge with any deferred header-phase mutation before responding.
 #[expect(
     clippy::too_many_lines,
     reason = "Reusable for request and response processing, better than 2 different functions"
@@ -295,17 +318,21 @@ pub(crate) async fn process_streamed_body_chunk(
         metrics::record_invalid_argument("missing_headers", "request");
         Status::invalid_argument("request headers not received")
     })?;
-    let mut ctx = adapter::build_filter_context(pipeline, request);
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     // Resolve the fallible response ref before hydrate drains carried state, so an
     // early return here leaves the parked state untouched.
-    if !is_request {
+    let original_response_headers = if is_request {
+        None
+    } else {
         let resp = state.response.as_mut().ok_or_else(|| {
             metrics::record_invalid_argument("missing_headers", "response");
             Status::invalid_argument("response headers not received")
         })?;
+        let original = capture_original_headers(resp);
         ctx.response_header = Some(resp);
         ctx.upstream_reached = true;
-    }
+        Some(original)
+    };
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
     let eos = body.end_of_stream;
     let mut chunk = body.body;
@@ -317,26 +344,79 @@ pub(crate) async fn process_streamed_body_chunk(
     if let Some(imm) = reject {
         return Ok(vec![response::immediate(imm)]);
     }
-    ctx.dehydrate(&mut state.carried_context)?;
-    let (mutation, body_mode) = if is_request {
-        (
-            state.deferred_request_header_mutation.take(),
-            state.protocol_config.request_body_mode,
-        )
+    let current_mutation = if is_request {
+        adapter::collect_request_header_mutations(&ctx)
     } else {
-        (
-            state.deferred_response_header_mutation.take(),
-            state.protocol_config.response_body_mode,
-        )
+        original_response_headers
+            .as_ref()
+            .and_then(|original| adapter::collect_response_header_mutations_diff(&ctx, original))
+    };
+    warn_unapplied_header_mutations(is_request, current_mutation.as_ref());
+    ctx.dehydrate(&mut state.carried_context)?;
+    let body_mode = if is_request {
+        state.protocol_config.request_body_mode
+    } else {
+        state.protocol_config.response_body_mode
     };
 
     let body_data = body_data_if_present(&chunk);
     let responses = if is_request {
-        response::request_body(body_data, mutation, body_mode, eos)
+        response::request_body(body_data, None, body_mode, eos)
     } else {
-        response::response_body(body_data, mutation, body_mode, eos)
+        response::response_body(body_data, None, body_mode, eos)
     };
     Ok(responses)
+}
+
+/// Once-per-process warning: `STREAMED` body filters produced header mutations.
+static STREAMED_HEADER_MUTATIONS: OnceWarning = OnceWarning::new();
+
+/// A configuration-mismatch warning that fires once per process.
+///
+/// The condition it guards depends on the pipeline and on Envoy's processing
+/// mode, not on the request, so repeating it for every stream would only flood
+/// the log; later occurrences are suppressed.
+struct OnceWarning(std::sync::atomic::AtomicBool);
+
+impl OnceWarning {
+    /// A warning that has not fired yet.
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    /// Whether this call is the first; every later call returns `false`.
+    fn first(&self) -> bool {
+        !self.0.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the warning has not fired yet, without firing it.
+    fn pending(&self) -> bool {
+        !self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Warn (once per process) when body filters changed headers that Envoy will not apply.
+///
+/// Header mutations on a body response only take effect in `BUFFERED` mode.
+/// In `STREAMED` mode the headers were forwarded when the `HeadersResponse`
+/// went out, so a filter that derives headers from the body is silently
+/// ineffective. Surface that so operators can switch the direction to
+/// `BUFFERED` or `FULL_DUPLEX_STREAMED`.
+fn warn_unapplied_header_mutations(is_request: bool, mutation: Option<&HeaderMutation>) {
+    if !STREAMED_HEADER_MUTATIONS.pending() {
+        return;
+    }
+
+    if let Some(mutation) = mutation
+        && STREAMED_HEADER_MUTATIONS.first()
+    {
+        warn!(
+            direction = if is_request { "request" } else { "response" },
+            set_headers = mutation.set_headers.len(),
+            remove_headers = mutation.remove_headers.len(),
+            "STREAMED body filters produced header mutations, which Envoy applies only in BUFFERED mode; dropped"
+        );
+    }
 }
 
 /// How header mutations are delivered after early filter execution.
@@ -353,11 +433,7 @@ pub(crate) enum MutationDelivery {
 
 impl MutationDelivery {
     /// Package mutation into responses per delivery strategy.
-    fn deliver_request(
-        self,
-        mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-        state: &mut StreamState,
-    ) -> Vec<ProcessingResponse> {
+    fn deliver_request(self, mutation: Option<HeaderMutation>, state: &mut StreamState) -> Vec<ProcessingResponse> {
         match self {
             Self::Send => vec![response::request_headers(mutation)],
             Self::DeferWithResponse => {
@@ -372,11 +448,7 @@ impl MutationDelivery {
     }
 
     /// Package mutation into responses per delivery strategy.
-    fn deliver_response(
-        self,
-        mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-        state: &mut StreamState,
-    ) -> Vec<ProcessingResponse> {
+    fn deliver_response(self, mutation: Option<HeaderMutation>, state: &mut StreamState) -> Vec<ProcessingResponse> {
         match self {
             Self::Send => vec![response::response_headers(mutation)],
             Self::DeferWithResponse => {
@@ -400,11 +472,11 @@ pub(crate) async fn run_request_header_filters_early(
     let Some(request) = state.request.as_ref() else {
         return Ok(delivery.deliver_request(None, state));
     };
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
 
     let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -424,7 +496,7 @@ pub(crate) async fn run_response_header_filters_early(
         return Ok(delivery.deliver_response(None, state));
     };
 
-    let ctx = adapter::build_filter_context(pipeline, request);
+    let ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
     let Some(resp) = state.response.as_mut() else {
         return Ok(delivery.deliver_response(None, state));
     };
@@ -436,7 +508,7 @@ pub(crate) async fn run_response_header_filters_early(
     ctx.upstream_reached = true;
 
     let action = execute_response(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
+    if let Some(imm) = immediate_from_action(action) {
         return Ok(vec![response::immediate(imm)]);
     }
 
@@ -447,12 +519,9 @@ pub(crate) async fn run_response_header_filters_early(
     Ok(delivery.deliver_response(mutation, state))
 }
 
-/// Capture response header names and values before filter execution.
-fn capture_original_headers(resp: &Response) -> HashMap<String, String> {
-    resp.headers
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_owned()))
-        .collect()
+/// Capture response headers before filter execution.
+fn capture_original_headers(resp: &Response) -> HeaderMap {
+    resp.headers.clone()
 }
 
 /// Execute the request-phase pipeline.
@@ -471,19 +540,46 @@ async fn execute_response(pipeline: &FilterPipeline, ctx: &mut HttpFilterContext
         .map_err(|e| Status::internal(e.to_string()))
 }
 
-/// Convert a [`FilterAction::Reject`] into an `ImmediateResponse`.
-fn check_reject(action: FilterAction) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
-    if let FilterAction::Reject(rejection) = action {
-        metrics::record_immediate_response();
-        Some(adapter::rejection_to_immediate(&rejection))
-    } else {
-        None
+/// Convert a short-circuiting [`FilterAction`] into an `ImmediateResponse`.
+///
+/// Both `Reject` and `TerminalResponse` end the stream with a local reply at
+/// Envoy; every other action means the pipeline continues.
+fn immediate_from_action(
+    action: FilterAction,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse> {
+    match action {
+        FilterAction::Reject(rejection) => {
+            metrics::record_immediate_response();
+            Some(adapter::rejection_to_immediate(&rejection))
+        },
+        FilterAction::TerminalResponse(terminal) => {
+            metrics::record_immediate_response();
+            Some(adapter::terminal_response_to_immediate(&terminal))
+        },
+        _ => None,
     }
 }
 
 // -----------------------------------------------------------------------------
 // Filters
 // -----------------------------------------------------------------------------
+
+/// Run request-body filters at end of stream, skipping the headers-only phase.
+///
+/// The headers phase is reached only for a headers-only request (headers carried
+/// `end_of_stream`), so there is no body to filter. The body phase always runs the
+/// hook, even for an empty buffer, so an end-of-stream rejection still fires.
+async fn run_request_body_filters_at_eos(
+    phase: RequestPhase,
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    request_body: &mut Vec<u8>,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    match phase {
+        RequestPhase::Headers => Ok(None),
+        RequestPhase::Body => run_body_filters(pipeline, ctx, request_body, true).await,
+    }
+}
 
 /// Run request body filters if the pipeline has body capabilities.
 async fn run_body_filters(
@@ -492,7 +588,7 @@ async fn run_body_filters(
     body_buf: &mut Vec<u8>,
     eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if body_buf.is_empty() {
+    if body_buf.is_empty() && !eos {
         return Ok(None);
     }
 
@@ -506,11 +602,7 @@ async fn run_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
-
-    Ok(None)
+    Ok(immediate_from_action(action))
 }
 
 /// Run response body filters (synchronous, per Pingora constraint).
@@ -520,7 +612,7 @@ fn run_resp_body_filters(
     body_buf: &mut Vec<u8>,
     eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
-    if body_buf.is_empty() {
+    if body_buf.is_empty() && !eos {
         return Ok(None);
     }
 
@@ -533,11 +625,82 @@ fn run_resp_body_filters(
         *body_buf = b.to_vec();
     }
 
-    if let FilterAction::Reject(rejection) = action {
-        return Ok(Some(adapter::rejection_to_immediate(&rejection)));
-    }
+    Ok(immediate_from_action(action))
+}
 
-    Ok(None)
+// -----------------------------------------------------------------------------
+// Trailer-Closed Body Flush
+// -----------------------------------------------------------------------------
+
+/// Give STREAMED body filters their end-of-stream call when trailers close the
+/// body.
+///
+/// Every chunk was answered as it arrived but none carried `end_of_stream`, so
+/// filters that finish at end of stream (access logging, token accounting) would
+/// otherwise never run it. Run the body filters once more with no data and the
+/// flag set; a reject or terminal response still applies, while body bytes
+/// produced here have no message to ride on and are dropped (see
+/// [`run_trailing_body`]).
+pub(crate) async fn flush_streamed_body_filters(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state.request.as_ref().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "request");
+        Status::invalid_argument("request headers not received")
+    })?;
+    let mut ctx = adapter::build_filter_context(pipeline, request, state.trust_forwarded_for);
+    // Resolve the fallible response ref before hydrate drains carried state, so an
+    // early return here leaves the parked state untouched.
+    if !is_request {
+        let resp = state.response.as_mut().ok_or_else(|| {
+            metrics::record_invalid_argument("missing_headers", "response");
+            Status::invalid_argument("response headers not received")
+        })?;
+        ctx.response_header = Some(resp);
+        ctx.upstream_reached = true;
+    }
+    let mut ctx = HydratedContext::hydrate(state.carried_context.take(), ctx)?;
+    let action = run_trailing_body(pipeline, &mut ctx, is_request).await?;
+    ctx.dehydrate(&mut state.carried_context)?;
+    Ok(immediate_from_action(action)
+        .map(response::immediate)
+        .into_iter()
+        .collect())
+}
+
+/// Run body filters once with `end_of_stream` set and no data.
+///
+/// Bytes produced here can only ride a body message, but trailers already closed
+/// the body: the next message is the trailers ack, which carries no body. An
+/// immediate action (reject or terminal response) supersedes the body; any other
+/// leftover bytes have no message to carry them and are dropped with a warning.
+async fn run_trailing_body(
+    pipeline: &FilterPipeline,
+    ctx: &mut HttpFilterContext<'_>,
+    is_request: bool,
+) -> Result<FilterAction, Status> {
+    let mut body: Option<Bytes> = None;
+    let action = if is_request {
+        pipeline.execute_http_request_body(ctx, &mut body, true).await
+    } else {
+        pipeline.execute_http_response_body(ctx, &mut body, true)
+    }
+    .map_err(|e| Status::internal(e.to_string()))?;
+
+    if body.as_ref().is_some_and(|b| !b.is_empty()) {
+        warn!(
+            direction = direction_label(is_request),
+            "body filters produced bytes at end of stream after trailers; no message can carry them"
+        );
+    }
+    Ok(action)
+}
+
+/// Direction label for diagnostics.
+pub(crate) const fn direction_label(is_request: bool) -> &'static str {
+    if is_request { "request" } else { "response" }
 }
 
 // -----------------------------------------------------------------------------
@@ -552,10 +715,7 @@ fn body_data_if_present(buf: &[u8]) -> Option<&[u8]> {
 /// Merge deferred header mutations with current mutations.
 ///
 /// When both are present, combines their `set_headers` and `remove_headers` vectors.
-fn merge_mutations(
-    deferred: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-    current: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+fn merge_mutations(deferred: Option<HeaderMutation>, current: Option<HeaderMutation>) -> Option<HeaderMutation> {
     match (deferred, current) {
         (None, None) => None,
         (Some(m), None) | (None, Some(m)) => Some(m),
@@ -580,13 +740,33 @@ mod tests {
     use crate::test_support::snapshot_counter;
 
     /// Read the `content-length` value from a header mutation, if present.
-    fn content_length_of(
-        mutation: &Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
-    ) -> Option<String> {
+    fn content_length_of(mutation: &Option<HeaderMutation>) -> Option<String> {
         mutation.as_ref()?.set_headers.iter().find_map(|h| {
             let hv = h.header.as_ref()?;
             hv.key.eq_ignore_ascii_case("content-length").then(|| hv.value.clone())
         })
+    }
+
+    #[test]
+    fn immediate_from_action_converts_terminal_response() {
+        let terminal = praxis_filter::TerminalResponse::new(200).with_body(Bytes::from_static(b"done"));
+        let imm = immediate_from_action(FilterAction::TerminalResponse(Box::new(terminal))).unwrap();
+        assert_eq!(imm.status.unwrap().code, 200, "terminal status carried through");
+        assert_eq!(imm.body, "done", "terminal body carried through");
+    }
+
+    #[test]
+    fn immediate_from_action_converts_reject() {
+        let imm = immediate_from_action(FilterAction::Reject(praxis_filter::Rejection::status(403))).unwrap();
+        assert_eq!(imm.status.unwrap().code, 403, "reject status carried through");
+    }
+
+    #[test]
+    fn immediate_from_action_passes_through_continue() {
+        assert!(
+            immediate_from_action(FilterAction::Continue).is_none(),
+            "Continue must not short-circuit"
+        );
     }
 
     #[test]
@@ -648,7 +828,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state).await;
+            let result = run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true).await;
             assert!(result.is_err(), "missing request headers must be rejected");
         }
         let count = snapshot_counter(
@@ -672,7 +852,7 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         {
             let _guard = ::metrics::set_default_local_recorder(&recorder);
-            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state).await;
+            let result = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true).await;
             assert!(result.is_err(), "missing response headers must be rejected");
         }
         let count = snapshot_counter(
@@ -746,6 +926,303 @@ mod tests {
         crate::config::build_pipeline(&cfg, &registry).unwrap()
     }
 
+    /// Filter that rejects from its body hooks.
+    struct RejectBodyFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RejectBodyFilter {
+        fn name(&self) -> &'static str {
+            "reject_body"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        fn response_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+        }
+
+        fn on_response_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Reject(praxis_filter::Rejection::status(403)))
+        }
+    }
+    impl RejectBodyFilter {
+        /// Registry factory for `reject_body`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Filter that emits body bytes at end of stream.
+    struct TrailingByteFilter;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for TrailingByteFilter {
+        fn name(&self) -> &'static str {
+            "trailing_bytes"
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadWrite
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_response(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        async fn on_request_body(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if end_of_stream {
+                *body = Some(Bytes::from_static(b"late"));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl TrailingByteFilter {
+        /// Registry factory for `trailing_bytes`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// Registry factory signature for the single-filter test pipelines.
+    type FilterFactoryFn =
+        fn(&serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError>;
+
+    /// Build a single-filter pipeline from a registry factory.
+    fn single_filter_pipeline(name: &'static str, factory: FilterFactoryFn) -> Arc<FilterPipeline> {
+        use praxis_filter::FilterRegistry;
+
+        let cfg: crate::config::ExtProcConfig = serde_yaml::from_str(&format!(
+            "filter_chains:\n  - name: main\n    filters:\n      - filter: {name}\n"
+        ))
+        .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry.register(name, praxis_filter::http_builtin(factory)).unwrap();
+        crate::config::build_pipeline(&cfg, &registry).unwrap()
+    }
+
+    /// A reject from a request-body filter must short-circuit with an immediate
+    /// response and record the immediate-response metric, matching the header
+    /// paths (both now route through `immediate_from_action`).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn request_body_reject_short_circuits_and_records_metric() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.request_body = b"payload".to_vec();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let responses = {
+            let _guard = ::metrics::set_default_local_recorder(&recorder);
+            run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+                .await
+                .expect("a body reject must produce an immediate response, not an error")
+        };
+        assert_eq!(
+            responses.len(),
+            1,
+            "a body reject yields exactly one immediate response"
+        );
+        assert!(
+            responses.first().is_some_and(response::is_immediate),
+            "a body-filter reject must be delivered as an immediate response"
+        );
+        assert_eq!(
+            snapshot_counter(&snapshotter, "praxis_extproc_immediate_responses_total", &[]),
+            1,
+            "a body-filter reject must record the immediate-response metric like the header paths"
+        );
+    }
+
+    /// A reject from a response-body filter must short-circuit too.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn response_body_reject_short_circuits() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        state.response_body = b"payload".to_vec();
+
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("a body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "a body-filter reject must be delivered as an immediate response"
+        );
+    }
+
+    /// When trailers close a streamed body and a filter emits bytes at end of
+    /// stream, no ExtProc message can carry them; the flush drops them with a
+    /// warning and acknowledges the trailers rather than emitting a response.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn trailing_body_bytes_without_carrier_dropped() {
+        let pipeline = single_filter_pipeline("trailing_bytes", TrailingByteFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+
+        // Run the headers phase first so the filter is marked executed and its
+        // context carries into the trailer-close flush.
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true)
+            .await
+            .expect("headers phase must succeed");
+
+        let responses = flush_streamed_body_filters(&pipeline, &mut state, true)
+            .await
+            .expect("undeliverable end-of-stream bytes are dropped, not an error");
+        assert!(
+            responses.is_empty(),
+            "dropped trailing bytes without a rejection yield no response: {responses:?}"
+        );
+    }
+
+    /// A body filter that rejects at end of stream must fire even when the
+    /// buffered body is empty (e.g. trailers closed it with no bytes); otherwise
+    /// skipping the empty-buffer EOS call silently drops the rejection.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn empty_buffered_request_body_still_runs_eos_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        // request_body left empty, as when trailers close a body with no bytes.
+        let responses = run_request_pipeline(RequestPhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("an empty-body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "an empty buffered body must still trigger the body-filter rejection: {responses:?}"
+        );
+    }
+
+    /// Response-side mirror: an empty buffered response body must still give
+    /// response-body filters their end-of-stream call.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn empty_buffered_response_body_still_runs_eos_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        // response_body left empty.
+        let responses = run_response_pipeline(ResponsePhase::Body, &pipeline, &mut state, true)
+            .await
+            .expect("an empty-body reject must produce an immediate response, not an error");
+        assert!(
+            responses.iter().any(response::is_immediate),
+            "an empty buffered response body must still trigger the body-filter rejection: {responses:?}"
+        );
+    }
+
+    /// A headers-only response (headers EOS=true, no body message, e.g. a local
+    /// reply) must not run body filters on the never-streamed body: doing so
+    /// would let a body filter reject or rewrite a response that has no body,
+    /// swallowing the headers-only reply.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    async fn headers_only_response_does_not_run_body_filters() {
+        let pipeline = single_filter_pipeline("reject_body", RejectBodyFilter::from_config);
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.response = Some(adapter::envoy_headers_to_response(&[]));
+        // response_body left empty: the response is headers-only.
+        let responses = run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true)
+            .await
+            .expect("a headers-only response must pass through, not error");
+        assert!(
+            !responses.iter().any(response::is_immediate),
+            "a headers-only response must not trigger a body-filter rejection: {responses:?}"
+        );
+    }
+
+    /// A multi-valued response header no filter touched must not read as a
+    /// mutation. Snapshotting through a map that folds duplicate names
+    /// (last-one-wins) would drop entries and make an untouched `Set-Cookie`
+    /// look changed, forcing a spurious re-emit and route re-evaluation.
+    #[test]
+    #[expect(clippy::expect_used, reason = "tests")]
+    fn capture_preserves_multivalued_headers_no_spurious_mutation() {
+        use praxis_filter::FilterRegistry;
+
+        let mut resp = Response {
+            status: http::StatusCode::OK,
+            headers: HeaderMap::new(),
+        };
+        resp.headers.append(
+            http::header::SET_COOKIE,
+            "session=a".parse().expect("valid header value"),
+        );
+        resp.headers
+            .append(http::header::SET_COOKIE, "theme=b".parse().expect("valid header value"));
+
+        // Snapshot exactly as the response phase does, before any filter runs.
+        let original = capture_original_headers(&resp);
+
+        let pipeline = FilterPipeline::build(&mut [], &FilterRegistry::with_builtins()).expect("empty pipeline");
+        let request = adapter::envoy_headers_to_request(&[]);
+        let mut ctx = adapter::build_filter_context(&pipeline, &request, false);
+        ctx.response_header = Some(&mut resp);
+
+        let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original);
+
+        assert!(
+            mutation.is_none(),
+            "an untouched multi-valued Set-Cookie must yield no mutation, but got: {mutation:?}"
+        );
+    }
+
     /// Removes temporary files created by protocol integration tests even
     /// when an assertion fails before the normal cleanup path runs.
     struct TempFiles(Vec<std::path::PathBuf>);
@@ -768,7 +1245,7 @@ mod tests {
         state.request = Some(adapter::envoy_headers_to_request(&[]));
 
         // Request phase stores state; it must persist into StreamState.
-        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state)
+        run_request_pipeline(RequestPhase::Headers, &pipeline, &mut state, true)
             .await
             .unwrap();
         assert!(
@@ -782,7 +1259,7 @@ mod tests {
 
         // Response phase restores state; the probe surfaces what it observed.
         state.response = Some(adapter::envoy_headers_to_response(&[]));
-        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state)
+        run_response_pipeline(ResponsePhase::Headers, &pipeline, &mut state, true)
             .await
             .unwrap();
         assert_eq!(
@@ -849,7 +1326,7 @@ mod tests {
             header("authorization", "Bearer caller"),
             header("x-api-key", "caller-key"),
         ]);
-        let mut context = adapter::build_filter_context(&pipeline, &request);
+        let mut context = adapter::build_filter_context(&pipeline, &request, false);
         let _action = pipeline.execute_http_request(&mut context).await.unwrap();
         let mutation = adapter::collect_request_header_mutations(&context).expect("handoff must mutate headers");
 
@@ -1160,7 +1637,7 @@ mod tests {
 
         // Seed every carried field on a hydrated context, the way a filter would
         // (through DerefMut), so `hydrate` stays the only way to build one.
-        let ctx = adapter::build_filter_context(&pipeline, &request);
+        let ctx = adapter::build_filter_context(&pipeline, &request, false);
         let mut hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), ctx).unwrap();
         hydrated.branch_iterations.insert(Arc::from("branch-a"), 3);
         hydrated.executed_filter_indices = vec![true, false, true];
@@ -1189,7 +1666,7 @@ mod tests {
 
         // hydrate must restore every field into a freshly built context,
         // consuming the parked value and emptying the slot.
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(carried), fresh).unwrap();
         assert_eq!(hydrated.branch_iterations.get("branch-a"), Some(&3));
         assert_eq!(hydrated.executed_filter_indices, vec![true, false, true]);
@@ -1208,7 +1685,7 @@ mod tests {
     fn hydrate_reports_missing_carried_context() {
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
 
         let result = HydratedContext::hydrate(None, fresh);
         assert!(
@@ -1228,12 +1705,12 @@ mod tests {
         let mut slot = Some(CarriedContext::default());
 
         // First hydrate drains the slot to None.
-        let first = adapter::build_filter_context(&pipeline, &request);
+        let first = adapter::build_filter_context(&pipeline, &request, false);
         let _hydrated = HydratedContext::hydrate(slot.take(), first).unwrap();
         assert!(slot.is_none(), "hydrate's take must leave the slot None");
 
         // Second hydrate finds None and must error instead of carrying empty state.
-        let second = adapter::build_filter_context(&pipeline, &request);
+        let second = adapter::build_filter_context(&pipeline, &request, false);
         let result = HydratedContext::hydrate(slot.take(), second);
         assert!(
             matches!(&result, Err(e) if e.code() == tonic::Code::Internal),
@@ -1250,7 +1727,7 @@ mod tests {
 
         let pipeline = carry_probe_pipeline();
         let request = adapter::envoy_headers_to_request(&[]);
-        let fresh = adapter::build_filter_context(&pipeline, &request);
+        let fresh = adapter::build_filter_context(&pipeline, &request, false);
         let hydrated = HydratedContext::hydrate(Some(CarriedContext::default()), fresh).unwrap();
 
         // The slot is still occupied: a prior phase failed to drain it.
@@ -1269,6 +1746,118 @@ mod tests {
             slot.as_ref().unwrap().filter_metadata.get("kept").map(String::as_str),
             Some("yes"),
             "a rejected dehydrate must not overwrite the parked context"
+        );
+    }
+
+    /// Body filter that derives a routing header from the request body,
+    /// modelling BBR's `model_to_header`. Declares `ReadOnly` body access so
+    /// the pipeline reports `needs_request_body`, and sets the header only in
+    /// the body phase -- never at header time.
+    struct ModelHeaderProbe;
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for ModelHeaderProbe {
+        fn name(&self) -> &'static str {
+            "model_header_probe"
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            Ok(FilterAction::Continue)
+        }
+
+        fn request_body_access(&self) -> praxis_filter::BodyAccess {
+            praxis_filter::BodyAccess::ReadOnly
+        }
+
+        async fn on_request_body(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+            body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+        ) -> Result<FilterAction, praxis_filter::FilterError> {
+            if body.as_ref().is_some_and(|b| !b.is_empty()) {
+                ctx.request_headers_to_set.push((
+                    "x-gateway-model-name".parse().unwrap(),
+                    "internal-model".parse().unwrap(),
+                ));
+            }
+            Ok(FilterAction::Continue)
+        }
+    }
+    impl ModelHeaderProbe {
+        /// Registry factory for `model_header_probe`.
+        #[expect(clippy::unnecessary_wraps, reason = "FilterFactory signature requires Result")]
+        fn from_config(
+            _: &serde_yaml::Value,
+        ) -> Result<Box<dyn praxis_filter::HttpFilter>, praxis_filter::FilterError> {
+            Ok(Box::new(Self))
+        }
+    }
+
+    /// A body-derived header set in the body phase must NOT be emitted under
+    /// `STREAMED`.
+    ///
+    /// Envoy already forwarded the headers upstream, so a header mutation on a
+    /// body message is dropped and re-routing cannot happen; emitting it (with
+    /// `clear_route_cache`) would only promise a routing change that never
+    /// occurs. The chunk itself is still forwarded, and a once-per-process
+    /// warning is the operator's signal to switch to BUFFERED or full-duplex.
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "test sets up a pipeline, filter, and assertions")]
+    async fn streamed_request_body_derived_header_mutations_are_not_emitted() {
+        use praxis_filter::FilterRegistry;
+        use praxis_proto::envoy::service::ext_proc::v3::processing_response::Response as ProtoResponse;
+
+        let cfg: crate::config::ExtProcConfig =
+            serde_yaml::from_str("filter_chains:\n  - name: main\n    filters:\n      - filter: model_header_probe\n")
+                .unwrap();
+        let mut registry = FilterRegistry::with_builtins();
+        registry
+            .register(
+                "model_header_probe",
+                praxis_filter::http_builtin(ModelHeaderProbe::from_config),
+            )
+            .unwrap();
+        let pipeline = crate::config::build_pipeline(&cfg, &registry).unwrap();
+        assert!(
+            pipeline.body_capabilities().needs_request_body,
+            "probe must opt into the request body so STREAMED routes through process_streamed_body_chunk"
+        );
+
+        let mut state = StreamState::new();
+        state.request = Some(adapter::envoy_headers_to_request(&[]));
+        state.protocol_config.request_body_mode = BodyMode::Streamed;
+
+        let payload = br#"{"model":"internal-model"}"#.to_vec();
+        let body = praxis_proto::envoy::service::ext_proc::v3::HttpBody {
+            body: payload.clone(),
+            end_of_stream: true,
+        };
+        let responses = process_streamed_body_chunk(&pipeline, body, &mut state, true)
+            .await
+            .unwrap();
+
+        let common = responses
+            .iter()
+            .find_map(|r| match &r.response {
+                Some(ProtoResponse::RequestBody(b)) => b.response.as_ref(),
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(
+            common.header_mutation.is_none(),
+            "Envoy ignores header mutations on STREAMED body responses, so none must be emitted"
+        );
+        assert!(
+            !common.clear_route_cache,
+            "no header mutation is emitted, so the route cache must not be cleared"
+        );
+        assert!(
+            common.body_mutation.is_some(),
+            "the body chunk itself must still be forwarded"
         );
     }
 }

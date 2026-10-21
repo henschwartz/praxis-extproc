@@ -35,39 +35,14 @@ async fn response_has_valid_structure() {
     }
 }
 
-#[tokio::test]
-async fn streaming() {
-    ensure_gateway_ready().await;
-    let client = http_client();
-    let url = format!("{}/v1/chat/completions", gateway_url());
-
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": true
-        }))
-        .send()
-        .await
-        .expect("request failed");
-
-    assert_eq!(resp.status(), 200);
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .expect("missing content-type")
-        .to_str()
-        .unwrap();
-    assert!(
-        content_type.contains("text/event-stream"),
-        "expected text/event-stream, got {content_type}"
-    );
-
-    let body = resp.text().await.expect("failed to read body");
-    assert!(body.contains("data: "), "body should contain SSE data lines");
-}
+// NOTE: a plain streaming-passthrough test (expecting 200 + an SSE body) is
+// deliberately absent. The e2e overlay enables `ai_guardrails` with a response
+// phase at the gateway level, so every request flows through it. As of
+// praxis-ai 0.7.0 (praxis-proxy/ai#1604) the filter fails closed on streaming
+// while a response guardrail is active, rejecting `stream: true` with a 422
+// before the upstream is reached — SSE passthrough is therefore impossible in
+// this overlay. That fail-closed contract is covered by
+// `guardrails::streaming_request_rejected_when_response_guardrails_enabled`.
 
 #[tokio::test]
 async fn tool_call_passthrough() {
@@ -207,6 +182,20 @@ async fn multi_turn_conversation() {
 async fn large_body_passthrough() {
     ensure_gateway_ready().await;
     let large_content = "x".repeat(100_000);
+    // Deterministic large-body passthrough on the in-cluster model: its throughput
+    // is predictable regardless of how much concurrent traffic the suite drives.
+    let resp = chat_completion("granite-8b", &large_content).await;
+
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn large_body_passthrough_external() {
+    ensure_gateway_ready().await;
+    let large_content = "x".repeat(100_000);
+    // Keep a large-body case on the external route: the direct/routing tests only
+    // send short prompts, so this preserves large-body coverage end-to-end on the
+    // external provider path.
     let resp = chat_completion("gpt-4", &large_content).await;
 
     assert_eq!(resp.status(), 200);
